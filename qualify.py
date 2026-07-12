@@ -202,8 +202,23 @@ class Qualify(Node):
         return f
 
     def _log(self, level, msg):
-        """Log through ROS (console) AND the plain-text run log file."""
-        getattr(self.get_logger(), level)(msg)
+        """Log through ROS (console) AND the plain-text run log file.
+
+        Each severity gets its own get_logger() call site (not one shared
+        `getattr(...)` line) -- rclpy identifies a logging statement by its
+        file+line to support throttle/once logging, so funnelling every
+        severity through a single line makes it see "the same statement
+        used a different severity" and raise ValueError.
+        """
+        logger = self.get_logger()
+        if level == "info":
+            logger.info(msg)
+        elif level == "warn":
+            logger.warn(msg)
+        elif level == "error":
+            logger.error(msg)
+        else:
+            logger.fatal(msg)
         self._run_log.write(f"{time.time():.3f} [{level.upper():5s}] {self.phase:16s} {msg}\n")
 
     def _log_cmd(self, x, y, z, r):
