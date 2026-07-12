@@ -6,18 +6,17 @@ qualify.py - Nautilus RoboSub qualifying run.
 
 NO DEPTH LOGIC. Mode is ALT_HOLD: ArduSub regulates depth on its own
 barometer and holds whatever depth the vehicle was launched at. This node
-never reads depth and never commands vertical thrust -- no ceiling guard,
-no over-depth abort, no surfacing at the end. Launch it at the depth you
-want it to run at.
+never reads depth and never commands vertical thrust. Launch it at the
+depth you want it to run at.
 
 Vision (pipe_detector.py, /nautilus/detections) owns WHERE the targets are;
-no phase terminates on a dead-reckoned distance. It also does its own
-confirm-streak state tracking now (see tracking.py) -- a gate is only
-"confirmed" there once several consecutive frames agree on bearing, and a
-brief dropout doesn't erase it. This node's job is therefore just: trust
-"confirmed" at ARM time (the one moment that matters most), and use
-whatever's fresh during the approach phases (a weaker reading is fine once
-under way -- it's corroborated by everything before it).
+no phase terminates on a dead-reckoned distance. pipe_detector.py already
+does its own confirm-streak state tracking (tracking.py) -- a gate is only
+"confirmed" once several consecutive frames agree on bearing, and a brief
+dropout doesn't erase it. This node trusts "confirmed" at ARM time (the one
+moment that matters most) and uses whatever's fresh during the approach
+(a weaker reading is fine once under way -- it's corroborated by everything
+before it).
 
 The INS owns heading, holds a straight line when a target is out of frame,
 and supplies the sanity bounds that abort the run if we drive somewhere
@@ -53,6 +52,29 @@ Z_NEUTRAL = 500.0   # ManualControl z: 500 = no vertical demand (ALT_HOLD)
 DT = 0.05           # 20 Hz control loop
 TEST_FORWARD_SECONDS = 2.0   # bench smoke test: see gate -> push forward this long -> stop
 
+# Fixed tuning constants. These get set once from pool testing and rarely
+# change between runs -- edit them here rather than adding another ROS
+# parameter nobody remembers to set. Only the things you'd actually want to
+# change per-run without a rebuild are declared as parameters below.
+KP_HEADING, KI_HEADING = 6.0, 0.4
+YAW_LIMIT, I_LIMIT = 400.0, 200.0
+VISION_TIMEOUT = 1.5          # s before a detection goes stale
+SETTLE_SECONDS = 3.0          # s of heading hold before driving
+GATE_OVERSHOOT = 2.5          # m of blind push once the gate leaves frame
+GATE_PASS_RANGE = 1.6         # m: closer than this, commit to passing
+POLE_STOP_OFFSET = 1.0        # m added to turn_radius for U-turn trigger
+POLE_DISTANCE_MAX = 45.0      # m, ABORT bound -- never a target
+SCAN_YAW = 150.0              # yaw demand while spinning in place looking for a target
+SEARCH_TIMEOUT = 90.0         # s
+GATE_MIN_CONF = 0.20          # sanity floor at ARM time only
+LOST_GRACE = 8.0              # s a target may vanish before we actively search
+RETURN_MARGIN = 4.0           # m past gate on the way back
+INS_TIMEOUT = 1.0             # s
+STATE_MAX_AGE = 5.0           # s: reject latched/stale /mavros/state
+UTURN_TIMEOUT = 120.0         # s
+UTURN_STALL_S = 15.0          # s without heading progress -> abort
+CMD_LOG_DIR = "~/nautilus_ws/logs"
+
 
 def wrap180(d):
     return (d + 180.0) % 360.0 - 180.0
@@ -70,79 +92,33 @@ class Qualify(Node):
         super().__init__("qualify")
 
         d = self.declare_parameter
-        d("pole_distance_max", 45.0)  # ABORT bound, not a target
-        d("turn_radius", 3.0)         # m, radius of the U-turn about the pole
-        d("turn_speed", 0.25)         # thrust fraction during the U-turn
-        d("vision_gain", 0.6)         # 0 = ignore camera, 1 = trust it fully
-        d("vision_timeout", 1.5)      # s before a detection goes stale
-        d("cruise_speed", 0.35)       # thrust fraction during transit
-        d("settle_seconds", 3.0)      # s of heading hold before driving
-        d("gate_overshoot", 2.5)      # m of blind push once the gate leaves frame
-        d("gate_pass_range", 1.6)     # m: closer than this, commit to passing
-        d("pole_stop_offset", 1.0)    # m added to turn_radius for U-turn trigger
-        d("search_yaw", 200.0)        # yaw demand while scanning
-        d("search_timeout", 90.0)
-        d("gate_acquire_timeout", 0.0)    # s to wait on deck. 0 = forever.
-        d("arm_delay", 5.0)               # s between gate acquired and arming
-        d("gate_min_conf", 0.20)          # sanity floor at ARM time only
-        d("scan_yaw_slow", 120.0)         # gentle scan while hunting the gate
-        d("lost_grace", 8.0)              # s a target may vanish before we search
-        d("return_margin", 4.0)       # m past gate on the way back
-        d("kp_heading", 6.0)
-        d("ki_heading", 0.4)
-        d("yaw_limit", 400.0)
-        d("i_limit", 200.0)
-        d("ins_timeout", 1.0)         # s
-        d("state_max_age", 5.0)       # s: reject latched/stale /mavros/state
-        # Runaway guard, NOT a schedule. Battery is the real time limit.
-        d("mission_timeout", 1000.0)  # s, hard abort
-        d("uturn_timeout", 120.0)     # s
-        d("uturn_stall_s", 15.0)      # s without heading progress -> abort
-        d("require_bottom_lock", False)
-        d("max_fom_ins", 10.0)        # only enforced if require_bottom_lock
-        d("target_heading", float("nan"))   # NaN -> capture at arm
-        d("startup_delay", 0.0)       # s to sit still after launch
-        d("skip_gate_wait", False)    # bench only: arm without seeing a gate
         d("dry_run", False)
-        d("cmd_log_dir", "~/nautilus_ws/logs")   # every command actually sent, csv
-        d("test_forward_only", False)   # bench: after arming, push forward
-                                         # TEST_FORWARD_SECONDS then disarm --
-                                         # skips the rest of the course
+        d("target_heading", float("nan"))   # NaN -> capture at arm
+        d("cruise_speed", 0.35)             # thrust fraction during transit
+        d("turn_radius", 3.0)               # m, radius of the U-turn about the pole
+        d("turn_speed", 0.25)               # thrust fraction during the U-turn
+        d("vision_gain", 0.6)               # 0 = ignore camera, 1 = trust it fully
+        d("arm_delay", 5.0)                 # s between gate acquired and arming
+        d("mission_timeout", 1000.0)        # s, hard abort -- runaway guard, not a schedule
+        d("gate_acquire_timeout", 0.0)      # s to wait on deck. 0 = forever.
+        d("skip_gate_wait", False)          # bench only: arm without seeing a gate
+        d("test_forward_only", False)       # bench: forward TEST_FORWARD_SECONDS, then disarm
+        d("require_bottom_lock", False)     # hard-gate on DVL bottom lock at launch
+        d("max_fom_ins", 10.0)              # only enforced if require_bottom_lock
 
         g = lambda n: self.get_parameter(n).value
-        self.pole_d_max = float(g("pole_distance_max"))
+        self.dry_run = bool(g("dry_run"))
+        self.gate_heading = float(g("target_heading"))
+        self.cruise_v = float(g("cruise_speed")) * 1000.0
         self.turn_r = float(g("turn_radius"))
         self.turn_v = float(g("turn_speed")) * 1000.0
         self.vis_gain = float(g("vision_gain"))
-        self.vis_timeout = float(g("vision_timeout"))
-        self.cruise_v = float(g("cruise_speed")) * 1000.0
-        self.settle_s = float(g("settle_seconds"))
-        self.overshoot = float(g("gate_overshoot"))
-        self.gate_pass_r = float(g("gate_pass_range"))
-        self.pole_stop_off = float(g("pole_stop_offset"))
-        self.search_yaw = float(g("search_yaw"))
-        self.search_timeout = float(g("search_timeout"))
-        self.acquire_timeout = float(g("gate_acquire_timeout"))
         self.arm_delay = float(g("arm_delay"))
-        self.gate_min_conf = float(g("gate_min_conf"))
-        self.scan_yaw_slow = float(g("scan_yaw_slow"))
-        self.lost_grace = float(g("lost_grace"))
-        self.return_margin = float(g("return_margin"))
-        self.kp = float(g("kp_heading"))
-        self.ki = float(g("ki_heading"))
-        self.yaw_limit = float(g("yaw_limit"))
-        self.i_limit = float(g("i_limit"))
-        self.ins_timeout = float(g("ins_timeout"))
-        self.state_max_age = float(g("state_max_age"))
         self.mission_timeout = float(g("mission_timeout"))
-        self.uturn_timeout = float(g("uturn_timeout"))
-        self.uturn_stall = float(g("uturn_stall_s"))
+        self.acquire_timeout = float(g("gate_acquire_timeout"))
+        self.test_forward_only = bool(g("test_forward_only"))
         self.require_lock = bool(g("require_bottom_lock"))
         self.max_fom = float(g("max_fom_ins"))
-        self.gate_heading = float(g("target_heading"))
-        self.dry_run = bool(g("dry_run"))
-        self.startup_delay = float(g("startup_delay"))
-        self.test_forward_only = bool(g("test_forward_only"))
 
         # INS state
         self.heading = None
@@ -191,16 +167,15 @@ class Qualify(Node):
         if self.dry_run:
             self.get_logger().warn("DRY RUN: no arm, no thrust published.")
 
-        self._cmd_log = self._open_cmd_log(str(g("cmd_log_dir")))
+        self._cmd_log = self._open_cmd_log()
 
-    def _open_cmd_log(self, log_dir):
+    def _open_cmd_log(self):
         """Every command this node ever sends (or would send, in dry_run)
         goes here as it's published -- x/y/z/r, post-clamp, with the phase
-        active at the time. This is the actual record of what moved the
-        vehicle, independent of console log level or whether a bag was
-        recording /mavros/manual_control/send.
+        active at the time. Plain always-on file, independent of console
+        log level or whether a bag was recording /mavros/manual_control/send.
         """
-        path = os.path.join(os.path.expanduser(log_dir),
+        path = os.path.join(os.path.expanduser(CMD_LOG_DIR),
                             f"qualify_cmds_{time.strftime('%Y%m%d_%H%M%S')}.csv")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         f = open(path, "w", buffering=1)   # line-buffered: survives a crash
@@ -275,7 +250,7 @@ class Qualify(Node):
         hdr = self.state.header.stamp
         age = self.get_clock().now().nanoseconds * 1e-9 - (
             hdr.sec + hdr.nanosec * 1e-9)
-        return age <= self.state_max_age
+        return age <= STATE_MAX_AGE
 
     def _on_ins(self, m):
         self.heading = float(m.heading) % 360.0
@@ -305,7 +280,7 @@ class Qualify(Node):
         if not rec:
             return None
         total_age = rec["age_s"] + (time.time() - rec["recv_t"])
-        return rec if total_age < self.vis_timeout else None
+        return rec if total_age < VISION_TIMEOUT else None
 
     def gate_bearing(self):
         r = self._fresh(self._gate)
@@ -327,7 +302,7 @@ class Qualify(Node):
         acquisition. Once approaching, a weaker reading is fine -- it's
         corroborated by everything before it."""
         r = self._fresh(self._gate)
-        return bool(r and r.get("confirmed") and r["conf"] >= self.gate_min_conf)
+        return bool(r and r.get("confirmed") and r["conf"] >= GATE_MIN_CONF)
 
     def pole_bearing(self):
         r = self._fresh(self._pole)
@@ -361,7 +336,7 @@ class Qualify(Node):
     def ins_ok(self):
         if self.heading is None or self.pos is None:
             return False
-        if (time.time() - self.ins_stamp) > self.ins_timeout:
+        if (time.time() - self.ins_stamp) > INS_TIMEOUT:
             return False
         if self.require_lock and self.fom_ins > self.max_fom:
             return False
@@ -391,10 +366,9 @@ class Qualify(Node):
         dt = 0.0 if self.last_t is None else now - self.last_t
         self.last_t = now
         if dt > 0.0:
-            self.integral = clamp(self.integral + err * dt,
-                                  -self.i_limit, self.i_limit)
-        return clamp(self.kp * err + self.ki * self.integral,
-                     -self.yaw_limit, self.yaw_limit)
+            self.integral = clamp(self.integral + err * dt, -I_LIMIT, I_LIMIT)
+        return clamp(KP_HEADING * err + KI_HEADING * self.integral,
+                     -YAW_LIMIT, YAW_LIMIT)
 
     def reset_pi(self):
         self.integral = 0.0
@@ -507,12 +481,6 @@ class Qualify(Node):
                 return 1
             self.get_logger().warn(msg + " Proceeding anyway.")
 
-        if self.startup_delay > 0:
-            self.get_logger().info(f"startup_delay {self.startup_delay:.0f}s")
-            t = time.time() + self.startup_delay
-            while time.time() < t and not self._abort_req:
-                rclpy.spin_once(self, timeout_sec=0.1)
-
         if not self.wait_for_gate():
             return 1
 
@@ -615,7 +583,7 @@ class Qualify(Node):
     def search(self, seen, what):
         """Yaw scan in place until `seen()` returns true. No forward thrust."""
         self.enter(f"SEARCH_{what.upper()}")
-        end = time.time() + self.search_timeout
+        end = time.time() + SEARCH_TIMEOUT
         direction = 1.0
         flip = time.time() + 8.0
         while time.time() < end:
@@ -625,7 +593,7 @@ class Qualify(Node):
             if time.time() > flip:
                 direction *= -1.0
                 flip = time.time() + 16.0
-            self.tick(0.0, self.search_yaw * direction)
+            self.tick(0.0, SCAN_YAW * direction)
         raise Abort(f"{what} not found during search")
 
     def settle(self):
@@ -633,7 +601,7 @@ class Qualify(Node):
         ALT_HOLD regulates depth on the Cube's own barometer at whatever
         depth we launched at, and z stays neutral for the whole run."""
         self.enter("SETTLE")
-        for _ in range(int(self.settle_s / DT)):
+        for _ in range(int(SETTLE_SECONDS / DT)):
             self.tick(0.0, self.yaw_to(self.gate_heading))
 
     def forward_test(self):
@@ -683,14 +651,14 @@ class Qualify(Node):
                 if time.time() > scan_flip:
                     scan_dir *= -1.0
                     scan_flip = time.time() + 12.0
-                self.tick(0.0, self.scan_yaw_slow * scan_dir)
+                self.tick(0.0, SCAN_YAW * scan_dir)
             else:
                 scan_flip = time.time() + 6.0
                 scan_dir = 1.0
                 # Centring matters more than heading here: full vision gain.
                 sp = (self.heading + b) % 360.0
                 self.tick(self.cruise_v, self.yaw_to(sp), z=Z_NEUTRAL)
-                if ok and rng < self.gate_pass_r:
+                if ok and rng < GATE_PASS_RANGE:
                     break
 
             self.log_every("through_gate", 2.0, lambda: (
@@ -703,20 +671,20 @@ class Qualify(Node):
         # heading captured on the surface. Everything downstream inherits it.
         self.gate_heading = self.heading
         self.return_heading = (self.gate_heading + 180.0) % 360.0
-        self.blind_push(self.gate_heading, self.overshoot)
+        self.blind_push(self.gate_heading, GATE_OVERSHOOT)
         self.get_logger().info("Through the gate.")
 
     def to_pole(self):
         """Far field: steer the pole's bearing, no range needed. Near field:
         stereo range becomes trustworthy, stop at turn radius.
-        pole_distance_max is an abort bound, never a target."""
+        POLE_DISTANCE_MAX is an abort bound, never a target."""
         self.enter("TO_POLE")
-        stop_at = self.turn_r + self.pole_stop_off
+        stop_at = self.turn_r + POLE_STOP_OFFSET
         lost_since = None
 
         while True:
             along, cross = self.along_cross()
-            if along > self.pole_d_max:
+            if along > POLE_DISTANCE_MAX:
                 raise Abort(f"{along:.1f}m out, past the sanity bound")
 
             b = self.pole_bearing()
@@ -725,7 +693,7 @@ class Qualify(Node):
             if b is None:
                 if lost_since is None:
                     lost_since = time.time()
-                elif time.time() - lost_since > self.lost_grace * 1.5:
+                elif time.time() - lost_since > LOST_GRACE * 1.5:
                     self.search(lambda: self.pole_bearing() is not None, "pole")
                     lost_since = None
                     continue
@@ -756,18 +724,18 @@ class Qualify(Node):
 
         turned = 0.0
         prev = self.heading
-        hard = time.time() + self.uturn_timeout
+        hard = time.time() + UTURN_TIMEOUT
         best = 0.0
         last_progress = time.time()
 
         while turned < 178.0:
             if time.time() > hard:
-                raise Abort(f"u-turn exceeded {self.uturn_timeout:.0f}s "
+                raise Abort(f"u-turn exceeded {UTURN_TIMEOUT:.0f}s "
                             f"({turned:.0f} of 180 deg)")
             if turned > best + 5.0:
                 best = turned
                 last_progress = time.time()
-            elif time.time() - last_progress > self.uturn_stall:
+            elif time.time() - last_progress > UTURN_STALL_S:
                 raise Abort(f"u-turn stalled at {turned:.0f} deg. "
                             f"Yaw authority? Thruster failure?")
 
@@ -779,12 +747,12 @@ class Qualify(Node):
 
     def return_to_origin(self):
         """Steer to the live bearing toward the launch point (so the u-turn's
-        lateral offset self-corrects), then continue return_margin metres
+        lateral offset self-corrects), then continue RETURN_MARGIN metres
         past the gate."""
         self.enter("RETURN")
         while True:
             along, cross = self.along_cross()
-            if along <= -self.return_margin:
+            if along <= -RETURN_MARGIN:
                 break
 
             dx = self.origin[0] - self.pos[0]
