@@ -72,7 +72,7 @@ FAKE_GATE_SECONDS = 20.0   # fake_gate:=true fakes a solid gate for this long, o
 FAKE_GATE_START_RANGE = 8.0   # m: simulated range at the start of the fake window
 
 # SEEK_ALTITUDE (the one exception to "no depth logic" -- see module docstring)
-TARGET_ALTITUDE_M = 0.0      # m above the pool floor to reach before SETTLE
+TARGET_ALTITUDE_M = 0.5      # m above the pool floor to reach before SETTLE
 ALTITUDE_TOLERANCE_M = 0.1    # m: within this band of target counts as "there"
 ALTITUDE_KP = 300.0           # z units per metre of error -- verify in pool
 ALTITUDE_Z_MAX = 200.0        # z units off neutral, hard cap (of the 0-1000 range) --
@@ -124,7 +124,7 @@ class Qualify(Node):
 
         d = self.declare_parameter
         d("dry_run", False)
-        d("fake_gate", True)                # bench: fake a solid gate, no camera needed --
+        d("fake_gate", False)                # bench: fake a solid gate, no camera needed --
                                              # default ON; pass fake_gate:=false for a real run
         d("fake_gate_bearing_deg", 0.0)     # bearing to report while faking
         d("fake_gate_range_m", 3.0)         # range simulated CLOSING to by the end of the window
