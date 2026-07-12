@@ -73,7 +73,11 @@ TARGET_ALTITUDE_M = 0.0      # m above the pool floor to reach before SETTLE
 ALTITUDE_TOLERANCE_M = 0.1    # m: within this band of target counts as "there"
 ALTITUDE_KP = 150.0           # z units per metre of error -- gentle; verify in pool
 ALTITUDE_Z_MAX = 80.0         # z units off neutral, hard cap (of the 0-1000 range)
-ALTITUDE_TIMEOUT = 30.0       # s to reach target before aborting
+ALTITUDE_TIMEOUT = 120.0      # s to reach target before aborting
+ALTIMETER_TIMEOUT = 3.0       # s: altimeter reports in pulses, not continuously --
+                              # this must be looser than INS_TIMEOUT or every gap
+                              # between pulses reads as "stale" and the z command
+                              # pulses on/off in lockstep with the sensor.
 ALTITUDE_MIN_SAFE_M = 0.0  # m: abort immediately this close to the floor, no matter what
 ALTITUDE_SIGN = 1.0           # UNVERIFIED direction -- flip to -1.0 if it moves the wrong way
 
@@ -707,7 +711,7 @@ class Qualify(Node):
 
             alt = self.altimeter_distance
             age = time.time() - self.altimeter_stamp
-            if age > INS_TIMEOUT:
+            if age > ALTIMETER_TIMEOUT:
                 self.log_every("seek_altitude_stale", 1.0, lambda: (
                     f"  altimeter stale ({age:.2f}s old, last reading {alt:.2f}m) "
                     f"-- holding, waiting for a fresh one"))
