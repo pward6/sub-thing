@@ -4,10 +4,20 @@ qualify.py - Nautilus gate run.
 
     Look for the gate -> drive to it -> stop -> disarm
 
-NO DEPTH LOGIC. Mode is ALT_HOLD: ArduSub regulates depth on its own
-barometer and holds whatever depth the vehicle was launched at. This node
-never reads depth and never commands vertical thrust. Launch it at the
-depth you want it to run at.
+ALMOST NO DEPTH LOGIC. Mode is ALT_HOLD: ArduSub regulates depth on its own
+barometer and holds whatever depth the vehicle is at. The ONE deliberate
+exception is SEEK_ALTITUDE, right after arming: it reads
+/nucleus_node/altimeter_packets and drives z until the vehicle is
+TARGET_ALTITUDE_M above the pool floor, then hands neutral z straight back
+to ALT_HOLD. Every other phase never touches z.
+
+SEEK_ALTITUDE's z-direction (ALTITUDE_SIGN) is UNVERIFIED -- whether raising
+z moves the vehicle up or down is an ArduSub/wiring convention this code
+does not know. Watch the first run with the vehicle well clear of the
+floor; if altimeter_distance moves the WRONG way, flip ALTITUDE_SIGN.
+ALTITUDE_MIN_SAFE_M is a hard abort independent of that: if the floor gets
+too close for any reason, it stops immediately regardless of which
+direction was intended.
 
 Vision (pipe_detector.py, /nautilus/detections) owns WHERE the gate is; the
 drive phase never terminates on a dead-reckoned distance, only on actually
@@ -52,10 +62,20 @@ from std_msgs.msg import Empty, String
 from rosidl_runtime_py.utilities import get_message
 
 INS_TOPIC = "/nucleus_node/ins_packets"
+ALTIMETER_TOPIC = "/nucleus_node/altimeter_packets"
 Z_NEUTRAL = 500.0   # ManualControl z: 500 = no vertical demand (ALT_HOLD)
 DT = 0.05           # 20 Hz control loop
 FAKE_GATE_SECONDS = 20.0   # fake_gate:=true fakes a solid gate for this long, once
 FAKE_GATE_START_RANGE = 8.0   # m: simulated range at the start of the fake window
+
+# SEEK_ALTITUDE (the one exception to "no depth logic" -- see module docstring)
+TARGET_ALTITUDE_M = 0.5       # m above the pool floor to reach before SETTLE
+ALTITUDE_TOLERANCE_M = 0.1    # m: within this band of target counts as "there"
+ALTITUDE_KP = 150.0           # z units per metre of error -- gentle; verify in pool
+ALTITUDE_Z_MAX = 80.0         # z units off neutral, hard cap (of the 0-1000 range)
+ALTITUDE_TIMEOUT = 30.0       # s to reach target before aborting
+ALTITUDE_MIN_SAFE_M = 0.2     # m: abort immediately this close to the floor, no matter what
+ALTITUDE_SIGN = 1.0           # UNVERIFIED direction -- flip to -1.0 if it moves the wrong way
 
 # Fixed tuning constants. These get set once from pool testing and rarely
 # change between runs -- edit them here rather than adding another ROS
@@ -126,6 +146,10 @@ class Qualify(Node):
         self.fom_ins = 999.0
         self.ins_stamp = 0.0
 
+        # Altimeter state (SEEK_ALTITUDE only)
+        self.altimeter_distance = None
+        self.altimeter_stamp = 0.0
+
         # Mission frame: origin + axis latched at arm
         self.origin = None
         self.armed_by_us = False
@@ -154,6 +178,7 @@ class Qualify(Node):
         self.ctrl = self.create_publisher(ManualControl,
                                           "/mavros/manual_control/send", 10)
         self._subscribe_ins(qos)
+        self._subscribe_altimeter(qos)
         self.create_subscription(String, "/nautilus/detections",
                                  self._on_detections, 10)
         self.create_subscription(Empty, "/nautilus/cmd/abort",
@@ -269,6 +294,21 @@ class Qualify(Node):
         self._log("info", f"INS type: {mt}")
         self.create_subscription(get_message(mt), INS_TOPIC, self._on_ins, qos)
 
+    def _subscribe_altimeter(self, qos):
+        deadline = time.time() + 10.0
+        mt = None
+        while time.time() < deadline and not mt:
+            for name, types in self.get_topic_names_and_types():
+                if name == ALTIMETER_TOPIC and types:
+                    mt = types[0]
+                    break
+            rclpy.spin_once(self, timeout_sec=0.2)
+        if not mt:
+            self._log("fatal", f"{ALTIMETER_TOPIC} absent. nautilus_up.sh running?")
+            raise SystemExit(1)
+        self._log("info", f"altimeter type: {mt}")
+        self.create_subscription(get_message(mt), ALTIMETER_TOPIC, self._on_altimeter, qos)
+
     # ---------------- callbacks ----------------
 
     def _on_state(self, msg):
@@ -297,6 +337,10 @@ class Qualify(Node):
         self.vel_x = float(m.velocity_nucleus_x)
         self.fom_ins = float(m.fom_ins)
         self.ins_stamp = time.time()
+
+    def _on_altimeter(self, m):
+        self.altimeter_distance = float(m.altimeter_distance)
+        self.altimeter_stamp = time.time()
 
     def _on_detections(self, msg):
         try:
@@ -537,6 +581,7 @@ class Qualify(Node):
             return 1
 
         try:
+            self.seek_altitude()
             self.settle()
             self.drive_to_gate()
         except Abort as e:
@@ -627,6 +672,57 @@ class Qualify(Node):
                 flip = time.time() + 16.0
             self.tick(0.0, SCAN_YAW * direction)
         raise Abort(f"{what} not found during search")
+
+    def seek_altitude(self):
+        """The one phase in this file that touches z. Drives toward
+        TARGET_ALTITUDE_M above the pool floor using /nucleus_node/
+        altimeter_packets, then hands neutral z straight back to ALT_HOLD --
+        every other phase holds z at Z_NEUTRAL by design.
+
+        ALTITUDE_SIGN is UNVERIFIED (see module docstring): watch the
+        altimeter log line for the first few seconds with the vehicle well
+        clear of the floor. If altimeter_distance moves the WRONG way
+        (shrinking when it should grow, or vice versa), flip ALTITUDE_SIGN.
+        ALTITUDE_MIN_SAFE_M aborts immediately regardless of that -- if the
+        floor gets too close for any reason, stop before asking questions.
+        """
+        self.enter("SEEK_ALTITUDE")
+        if not self.spin_until(lambda: self.altimeter_distance is not None,
+                               10.0, "altimeter"):
+            raise Abort("no altimeter data -- cannot seek altitude")
+
+        end = time.time() + ALTITUDE_TIMEOUT
+        while True:
+            alt = self.altimeter_distance
+            age = time.time() - self.altimeter_stamp
+            if age > INS_TIMEOUT:
+                raise Abort(f"altimeter stale ({age:.1f}s old) -- cannot seek altitude")
+            if alt < ALTITUDE_MIN_SAFE_M:
+                raise Abort(f"altimeter {alt:.2f}m < {ALTITUDE_MIN_SAFE_M}m safety floor")
+
+            error = TARGET_ALTITUDE_M - alt   # +ve: too close to the floor, need more room
+            if abs(error) <= ALTITUDE_TOLERANCE_M:
+                self._log("info",
+                    f"altitude {alt:.2f}m, target {TARGET_ALTITUDE_M:.2f}m "
+                    f"(within {ALTITUDE_TOLERANCE_M:.2f}m). Holding here.")
+                self.publish(0.0, 0.0, z=Z_NEUTRAL)
+                return
+            if time.time() > end:
+                raise Abort(f"could not reach {TARGET_ALTITUDE_M:.2f}m altitude in "
+                            f"{ALTITUDE_TIMEOUT:.0f}s (stuck at {alt:.2f}m, "
+                            f"error {error:+.2f}m)")
+
+            z = clamp(Z_NEUTRAL + ALTITUDE_SIGN * ALTITUDE_KP * error,
+                     Z_NEUTRAL - ALTITUDE_Z_MAX, Z_NEUTRAL + ALTITUDE_Z_MAX)
+            # Deliberately NOT labelled ascend/descend: which way z actually
+            # moves the vehicle is exactly the unverified thing being
+            # watched here. Read the trend of `altimeter` itself against
+            # the sign of `z - neutral` to find out, don't trust a label.
+            self.log_every("seek_altitude", 1.0, lambda: (
+                f"  altimeter {alt:.2f}m  target {TARGET_ALTITUDE_M:.2f}m  "
+                f"error {error:+.2f}m  age {age:.2f}s  "
+                f"z {z:.0f} (neutral {Z_NEUTRAL:.0f}, delta {z - Z_NEUTRAL:+.0f})"))
+            self.tick(0.0, 0.0, z=z)
 
     def settle(self):
         """Hold heading, no forward thrust. There is no depth logic here:
