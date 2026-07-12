@@ -51,6 +51,7 @@ from rosidl_runtime_py.utilities import get_message
 INS_TOPIC = "/nucleus_node/ins_packets"
 Z_NEUTRAL = 500.0   # ManualControl z: 500 = no vertical demand (ALT_HOLD)
 DT = 0.05           # 20 Hz control loop
+TEST_FORWARD_SECONDS = 2.0   # bench smoke test: see gate -> push forward this long -> stop
 
 
 def wrap180(d):
@@ -104,6 +105,9 @@ class Qualify(Node):
         d("skip_gate_wait", False)    # bench only: arm without seeing a gate
         d("dry_run", False)
         d("cmd_log_dir", "~/nautilus_ws/logs")   # every command actually sent, csv
+        d("test_forward_only", False)   # bench: after arming, push forward
+                                         # TEST_FORWARD_SECONDS then disarm --
+                                         # skips the rest of the course
 
         g = lambda n: self.get_parameter(n).value
         self.pole_d_max = float(g("pole_distance_max"))
@@ -138,6 +142,7 @@ class Qualify(Node):
         self.gate_heading = float(g("target_heading"))
         self.dry_run = bool(g("dry_run"))
         self.startup_delay = float(g("startup_delay"))
+        self.test_forward_only = bool(g("test_forward_only"))
 
         # INS state
         self.heading = None
@@ -529,10 +534,13 @@ class Qualify(Node):
 
         try:
             self.settle()
-            self.through_gate()
-            self.to_pole()
-            self.uturn()
-            self.return_to_origin()
+            if self.test_forward_only:
+                self.forward_test()
+            else:
+                self.through_gate()
+                self.to_pole()
+                self.uturn()
+                self.return_to_origin()
         except Abort as e:
             return self.abort(str(e))
 
@@ -627,6 +635,21 @@ class Qualify(Node):
         self.enter("SETTLE")
         for _ in range(int(self.settle_s / DT)):
             self.tick(0.0, self.yaw_to(self.gate_heading))
+
+    def forward_test(self):
+        """Bench smoke test: wait_for_gate()/ARM already happened the normal
+        way (the vehicle only got here because a gate was actually seen and
+        confirmed), so this just proves the vehicle DRIVES once that
+        happens -- push forward for TEST_FORWARD_SECONDS, then stop. Not a
+        mission phase: replaces through_gate()/to_pole()/uturn()/return_to_
+        origin() entirely when test_forward_only:=true. Uses tick(), so the
+        normal guards (abort request, INS loss, mission timeout) still apply.
+        """
+        self.enter("FORWARD_TEST")
+        end = time.time() + TEST_FORWARD_SECONDS
+        while time.time() < end:
+            self.tick(self.cruise_v, self.yaw_to(self.gate_heading))
+        self.get_logger().info(f"forward test complete ({TEST_FORWARD_SECONDS:.0f}s).")
 
     def blind_push(self, hdg, metres):
         """Drive `metres` on dead reckoning alone. Only for a short, known
