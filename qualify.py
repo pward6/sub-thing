@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
 """
-qualify.py - Nautilus RoboSub qualifying run.
+qualify.py - Nautilus gate run.
 
-    Gate -> transit to pole -> 180 u-turn -> return through gate -> disarm
+    Look for the gate -> drive to it -> stop -> disarm
 
 NO DEPTH LOGIC. Mode is ALT_HOLD: ArduSub regulates depth on its own
 barometer and holds whatever depth the vehicle was launched at. This node
 never reads depth and never commands vertical thrust. Launch it at the
 depth you want it to run at.
 
-Vision (pipe_detector.py, /nautilus/detections) owns WHERE the targets are;
-no phase terminates on a dead-reckoned distance. pipe_detector.py already
-does its own confirm-streak state tracking (tracking.py) -- a gate is only
-"confirmed" once several consecutive frames agree on bearing, and a brief
-dropout doesn't erase it. This node trusts "confirmed" at ARM time (the one
-moment that matters most) and uses whatever's fresh during the approach
-(a weaker reading is fine once under way -- it's corroborated by everything
-before it).
+Vision (pipe_detector.py, /nautilus/detections) owns WHERE the gate is; the
+drive phase never terminates on a dead-reckoned distance, only on actually
+seeing the gate close up. pipe_detector.py does its own confirm-streak state
+tracking (tracking.py) -- a gate is only "confirmed" once several consecutive
+frames agree on bearing, and a brief dropout doesn't erase it. This node
+trusts "confirmed" at ARM time (the one moment that matters most) and uses
+whatever's fresh while driving (a weaker reading is fine once under way --
+it's corroborated by everything before it).
 
-The INS owns heading, holds a straight line when a target is out of frame,
-and supplies the sanity bounds that abort the run if we drive somewhere
-absurd.
+The INS owns heading and supplies the sanity bounds that abort the run if we
+drive somewhere absurd.
 
     ros2 run nautilus_auto qualify --ros-args -p dry_run:=true
-    ros2 run nautilus_auto qualify --ros-args -p vision_gain:=0.0   # INS only
+    ros2 run nautilus_auto qualify --ros-args -p fake_gate:=true   # no camera needed
 
 PRE-FLIGHT: confirm in water that velocity_nucleus_x goes nonzero and
 fom_ins drops below ~5. On the bench it reads 0.0 / 44.9 and the position
@@ -50,7 +49,7 @@ from rosidl_runtime_py.utilities import get_message
 INS_TOPIC = "/nucleus_node/ins_packets"
 Z_NEUTRAL = 500.0   # ManualControl z: 500 = no vertical demand (ALT_HOLD)
 DT = 0.05           # 20 Hz control loop
-TEST_FORWARD_SECONDS = 2.0   # bench smoke test: see gate -> push forward this long -> stop
+FAKE_GATE_SECONDS = 2.0   # fake_gate:=true fakes a solid gate for this long, once
 
 # Fixed tuning constants. These get set once from pool testing and rarely
 # change between runs -- edit them here rather than adding another ROS
@@ -62,17 +61,11 @@ VISION_TIMEOUT = 1.5          # s before a detection goes stale
 SETTLE_SECONDS = 3.0          # s of heading hold before driving
 GATE_OVERSHOOT = 2.5          # m of blind push once the gate leaves frame
 GATE_PASS_RANGE = 1.6         # m: closer than this, commit to passing
-POLE_STOP_OFFSET = 1.0        # m added to turn_radius for U-turn trigger
-POLE_DISTANCE_MAX = 45.0      # m, ABORT bound -- never a target
-SCAN_YAW = 150.0              # yaw demand while spinning in place looking for a target
+SCAN_YAW = 150.0              # yaw demand while spinning in place looking for the gate
 SEARCH_TIMEOUT = 90.0         # s
 GATE_MIN_CONF = 0.20          # sanity floor at ARM time only
-LOST_GRACE = 8.0              # s a target may vanish before we actively search
-RETURN_MARGIN = 4.0           # m past gate on the way back
 INS_TIMEOUT = 1.0             # s
 STATE_MAX_AGE = 5.0           # s: reject latched/stale /mavros/state
-UTURN_TIMEOUT = 120.0         # s
-UTURN_STALL_S = 15.0          # s without heading progress -> abort
 CMD_LOG_DIR = "~/nautilus_ws/logs"
 
 
@@ -93,32 +86,27 @@ class Qualify(Node):
 
         d = self.declare_parameter
         d("dry_run", False)
+        d("fake_gate", False)               # bench: fake a solid gate, no camera needed
         d("target_heading", float("nan"))   # NaN -> capture at arm
-        d("cruise_speed", 0.35)             # thrust fraction during transit
-        d("turn_radius", 3.0)               # m, radius of the U-turn about the pole
-        d("turn_speed", 0.25)               # thrust fraction during the U-turn
-        d("vision_gain", 0.6)               # 0 = ignore camera, 1 = trust it fully
+        d("cruise_speed", 0.35)             # thrust fraction while driving
         d("arm_delay", 5.0)                 # s between gate acquired and arming
         d("mission_timeout", 1000.0)        # s, hard abort -- runaway guard, not a schedule
         d("gate_acquire_timeout", 0.0)      # s to wait on deck. 0 = forever.
         d("skip_gate_wait", False)          # bench only: arm without seeing a gate
-        d("test_forward_only", False)       # bench: forward TEST_FORWARD_SECONDS, then disarm
         d("require_bottom_lock", False)     # hard-gate on DVL bottom lock at launch
         d("max_fom_ins", 10.0)              # only enforced if require_bottom_lock
 
         g = lambda n: self.get_parameter(n).value
         self.dry_run = bool(g("dry_run"))
+        self.fake_gate = bool(g("fake_gate"))
         self.gate_heading = float(g("target_heading"))
         self.cruise_v = float(g("cruise_speed")) * 1000.0
-        self.turn_r = float(g("turn_radius"))
-        self.turn_v = float(g("turn_speed")) * 1000.0
-        self.vis_gain = float(g("vision_gain"))
         self.arm_delay = float(g("arm_delay"))
         self.mission_timeout = float(g("mission_timeout"))
         self.acquire_timeout = float(g("gate_acquire_timeout"))
-        self.test_forward_only = bool(g("test_forward_only"))
         self.require_lock = bool(g("require_bottom_lock"))
         self.max_fom = float(g("max_fom_ins"))
+        self._fake_until = None   # lazily set on first gate check, not at startup
 
         # INS state
         self.heading = None
@@ -137,12 +125,11 @@ class Qualify(Node):
         self.integral = 0.0
         self.last_t = None
 
-        # Vision: each is the pipe_detector.py "gate"/"pole" dict plus
-        # recv_t, or None. pipe_detector.py already does confirm-streak and
-        # hold-through-miss (age_s); recv_t catches the case where
-        # pipe_detector itself has died and stopped publishing entirely.
+        # Vision: the pipe_detector.py "gate" dict plus recv_t, or None.
+        # pipe_detector.py already does confirm-streak and hold-through-miss
+        # (age_s); recv_t catches the case where pipe_detector itself has
+        # died and stopped publishing entirely.
         self._gate = None
-        self._pole = None
         self._log_times = {}
 
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -166,6 +153,10 @@ class Qualify(Node):
         self.state_stamp = 0.0
         if self.dry_run:
             self.get_logger().warn("DRY RUN: no arm, no thrust published.")
+        if self.fake_gate:
+            self.get_logger().warn(
+                f"FAKE_GATE: gate will be faked CONFIRMED, dead ahead, for "
+                f"{FAKE_GATE_SECONDS:.0f}s the first time it's checked.")
 
         self._cmd_log = self._open_cmd_log()
 
@@ -264,61 +255,47 @@ class Qualify(Node):
             d = json.loads(msg.data)
         except (ValueError, TypeError):
             return
-        now = time.time()
         if d.get("gate"):
-            self._gate = dict(d["gate"], recv_t=now)
-        if d.get("pole"):
-            self._pole = dict(d["pole"], recv_t=now)
+            self._gate = dict(d["gate"], recv_t=time.time())
 
-    def _fresh(self, rec):
-        """A detection is fresh only if BOTH the message itself just
-        arrived (catches pipe_detector.py dying) AND its own age_s was
-        small when published (catches "still publishing, but hasn't
-        actually seen this in a while" -- pipe_detector.py holds a
-        confirmed reading through brief misses, so message arrival alone
-        is not enough)."""
-        if not rec:
+    def _gate_record(self):
+        """The gate reading to use right now: fake_gate override (once, for
+        FAKE_GATE_SECONDS, starting the first time this is called -- not at
+        node startup, which could be tens of seconds before anyone cares)
+        or whatever's actually fresh from pipe_detector.py."""
+        if self.fake_gate:
+            if self._fake_until is None:
+                self._fake_until = time.time() + FAKE_GATE_SECONDS
+            if time.time() < self._fake_until:
+                return {"bearing_deg": 0.0, "range_m": 0.0, "range_ok": False,
+                       "conf": 1.0, "confirmed": True}
+
+        if not self._gate:
             return None
-        total_age = rec["age_s"] + (time.time() - rec["recv_t"])
-        return rec if total_age < VISION_TIMEOUT else None
+        total_age = self._gate["age_s"] + (time.time() - self._gate["recv_t"])
+        return self._gate if total_age < VISION_TIMEOUT else None
 
     def gate_bearing(self):
-        r = self._fresh(self._gate)
+        r = self._gate_record()
         return r["bearing_deg"] if r else None
 
     def gate_range(self):
         """(range_m, ok) or (None, False) when no fresh detection."""
-        r = self._fresh(self._gate)
+        r = self._gate_record()
         return (r["range_m"], r["range_ok"]) if r else (None, False)
 
     def gate_conf(self):
-        r = self._fresh(self._gate)
+        r = self._gate_record()
         return r["conf"] if r else 0.0
 
     def gate_is_solid(self):
         """A gate good enough to ARM on. pipe_detector.py already requires
         several consecutive agreeing frames before it marks "confirmed";
         this just adds a confidence floor on top, and is ONLY applied at
-        acquisition. Once approaching, a weaker reading is fine -- it's
+        acquisition. Once driving, a weaker reading is fine -- it's
         corroborated by everything before it."""
-        r = self._fresh(self._gate)
+        r = self._gate_record()
         return bool(r and r.get("confirmed") and r["conf"] >= GATE_MIN_CONF)
-
-    def pole_bearing(self):
-        r = self._fresh(self._pole)
-        return r["bearing_deg"] if r else None
-
-    def pole_range(self):
-        r = self._fresh(self._pole)
-        return (r["range_m"], r["range_ok"]) if r else (None, False)
-
-    def visual_setpoint(self, base_hdg, bearing):
-        """Blend a camera bearing into a dead-reckoned heading setpoint.
-        vision_gain=0 disables it entirely -- correct if the detector is
-        misbehaving poolside."""
-        if bearing is None or self.vis_gain <= 0.0:
-            return base_hdg
-        return (self.heading + self.vis_gain * bearing) % 360.0
 
     # ---------------- geometry ----------------
 
@@ -488,7 +465,6 @@ class Qualify(Node):
             self.gate_heading = self.heading
             self.get_logger().info(f"Gate heading CAPTURED: {self.gate_heading:.1f}")
         self.origin = self.pos
-        self.return_heading = (self.gate_heading + 180.0) % 360.0
 
         self.enter("ARM")
         self.neutral()
@@ -502,13 +478,7 @@ class Qualify(Node):
 
         try:
             self.settle()
-            if self.test_forward_only:
-                self.forward_test()
-            else:
-                self.through_gate()
-                self.to_pole()
-                self.uturn()
-                self.return_to_origin()
+            self.drive_to_gate()
         except Abort as e:
             return self.abort(str(e))
 
@@ -517,14 +487,14 @@ class Qualify(Node):
             self.neutral()
             rclpy.spin_once(self, timeout_sec=DT)
         self.arm(False)
-        self.get_logger().info("Qualifying run complete.")
+        self.get_logger().info("Run complete.")
         return 0
 
     def wait_for_gate(self):
         """Hold on the surface, disarmed, until pipe_detector.py reports a
-        confirmed gate. The run does not begin on an enter keypress -- it
-        begins when the vehicle can see what it's aiming at. skip_gate_wait
-        bypasses this on the bench."""
+        confirmed gate (or fake_gate fakes one). The run does not begin on
+        an enter keypress -- it begins when the vehicle can see what it's
+        aiming at. skip_gate_wait bypasses this on the bench."""
         self.enter("WAIT_GATE")
         if bool(self.get_parameter("skip_gate_wait").value):
             self.get_logger().warn("skip_gate_wait: arming without a gate.")
@@ -604,21 +574,6 @@ class Qualify(Node):
         for _ in range(int(SETTLE_SECONDS / DT)):
             self.tick(0.0, self.yaw_to(self.gate_heading))
 
-    def forward_test(self):
-        """Bench smoke test: wait_for_gate()/ARM already happened the normal
-        way (the vehicle only got here because a gate was actually seen and
-        confirmed), so this just proves the vehicle DRIVES once that
-        happens -- push forward for TEST_FORWARD_SECONDS, then stop. Not a
-        mission phase: replaces through_gate()/to_pole()/uturn()/return_to_
-        origin() entirely when test_forward_only:=true. Uses tick(), so the
-        normal guards (abort request, INS loss, mission timeout) still apply.
-        """
-        self.enter("FORWARD_TEST")
-        end = time.time() + TEST_FORWARD_SECONDS
-        while time.time() < end:
-            self.tick(self.cruise_v, self.yaw_to(self.gate_heading))
-        self.get_logger().info(f"forward test complete ({TEST_FORWARD_SECONDS:.0f}s).")
-
     def blind_push(self, hdg, metres):
         """Drive `metres` on dead reckoning alone. Only for a short, known
         displacement -- never a guessed one."""
@@ -629,152 +584,50 @@ class Qualify(Node):
                 return
             self.tick(self.cruise_v, self.yaw_to(hdg), z=Z_NEUTRAL)
 
-    def through_gate(self):
-        """Approach and pass the gate. Gate visible -> drive at it, full
-        vision gain. Gate not seen -> zero forward thrust, gentle yaw scan.
-        Losing the gate is normal (a wave, a bubble, a bad frame) and just
-        pauses advance -- it only ends via passing the gate, driving 15 m
-        without passing it, the mission clock, or a guard failure."""
-        self.enter("THROUGH_GATE")
-        scan_dir = 1.0
-        scan_flip = time.time() + 6.0
+    def drive_to_gate(self):
+        """Look for the gate, then move toward it based on the tracked
+        state. Gate visible -> drive at it, steering on its live bearing.
+        Gate not seen -> zero forward thrust, spin in place looking for it.
+        Losing the gate briefly is normal (a wave, a bubble, a bad frame)
+        and just pauses advance; only an extended loss triggers an active
+        search, which aborts the run if it times out."""
+        self.enter("DRIVE_TO_GATE")
+        lost_since = None
 
         while True:
             along, _ = self.along_cross()
             if along > 15.0:
-                raise Abort(f"drove {along:.1f}m without passing the gate")
+                raise Abort(f"drove {along:.1f}m without reaching the gate")
 
             b = self.gate_bearing()
             rng, ok = self.gate_range()
 
             if b is None:
-                if time.time() > scan_flip:
-                    scan_dir *= -1.0
-                    scan_flip = time.time() + 12.0
-                self.tick(0.0, SCAN_YAW * scan_dir)
+                if lost_since is None:
+                    lost_since = time.time()
+                elif time.time() - lost_since > 3.0:
+                    self.search(lambda: self.gate_bearing() is not None, "gate")
+                    lost_since = None
+                    continue
+                self.tick(0.0, self.yaw_to(self.gate_heading))
             else:
-                scan_flip = time.time() + 6.0
-                scan_dir = 1.0
-                # Centring matters more than heading here: full vision gain.
-                sp = (self.heading + b) % 360.0
+                lost_since = None
+                sp = (self.heading + b) % 360.0   # centring > heading here
                 self.tick(self.cruise_v, self.yaw_to(sp), z=Z_NEUTRAL)
                 if ok and rng < GATE_PASS_RANGE:
                     break
 
-            self.log_every("through_gate", 2.0, lambda: (
+            self.log_every("drive_to_gate", 2.0, lambda: (
                 f"  gate b {b if b is None else round(b,1)}  "
                 f"r {rng if ok else '--'}  conf {self.gate_conf():.2f}  "
                 f"along {along:+.2f}"))
 
         self.get_logger().info(f"Gate at {rng:.2f}m. Pushing through.")
         # Our heading right now IS the true gate normal -- better than the
-        # heading captured on the surface. Everything downstream inherits it.
+        # heading captured on the surface.
         self.gate_heading = self.heading
-        self.return_heading = (self.gate_heading + 180.0) % 360.0
         self.blind_push(self.gate_heading, GATE_OVERSHOOT)
-        self.get_logger().info("Through the gate.")
-
-    def to_pole(self):
-        """Far field: steer the pole's bearing, no range needed. Near field:
-        stereo range becomes trustworthy, stop at turn radius.
-        POLE_DISTANCE_MAX is an abort bound, never a target."""
-        self.enter("TO_POLE")
-        stop_at = self.turn_r + POLE_STOP_OFFSET
-        lost_since = None
-
-        while True:
-            along, cross = self.along_cross()
-            if along > POLE_DISTANCE_MAX:
-                raise Abort(f"{along:.1f}m out, past the sanity bound")
-
-            b = self.pole_bearing()
-            rng, ok = self.pole_range()
-
-            if b is None:
-                if lost_since is None:
-                    lost_since = time.time()
-                elif time.time() - lost_since > LOST_GRACE * 1.5:
-                    self.search(lambda: self.pole_bearing() is not None, "pole")
-                    lost_since = None
-                    continue
-                # Coast straight on the gate axis while it is out of frame.
-                self.tick(self.cruise_v, self.yaw_to(self.gate_heading))
-            else:
-                lost_since = None
-                sp = self.visual_setpoint(self.gate_heading, b)
-                self.tick(self.cruise_v, self.yaw_to(sp))
-                if ok and rng <= stop_at:
-                    self.get_logger().info(f"Pole at {rng:.2f}m. Turning.")
-                    return
-
-            self.log_every("to_pole", 2.0, lambda: (
-                f"  pole b {b if b is None else round(b,1)}  "
-                f"r {rng if ok else '--'}  along {along:+6.2f}  "
-                f"cross {cross:+5.2f}  fom {self.fom_ins:.1f}"))
-
-    def uturn(self):
-        """180 deg arc around the pole. Constant forward thrust plus constant
-        yaw traces a circle of radius v/omega, stopping at 180 deg of
-        accumulated heading change. Radius is NOT measured -- yaw_cmd is a
-        starting guess; tune it in a pool by running this phase alone."""
-        self.enter("UTURN")
-        yaw_cmd = clamp(self.turn_v * 0.9 / max(self.turn_r, 1.0), 80.0, 350.0)
-        self.get_logger().info(
-            f"radius ~{self.turn_r:.1f}m, yaw_cmd {yaw_cmd:.0f}, 180 deg")
-
-        turned = 0.0
-        prev = self.heading
-        hard = time.time() + UTURN_TIMEOUT
-        best = 0.0
-        last_progress = time.time()
-
-        while turned < 178.0:
-            if time.time() > hard:
-                raise Abort(f"u-turn exceeded {UTURN_TIMEOUT:.0f}s "
-                            f"({turned:.0f} of 180 deg)")
-            if turned > best + 5.0:
-                best = turned
-                last_progress = time.time()
-            elif time.time() - last_progress > UTURN_STALL_S:
-                raise Abort(f"u-turn stalled at {turned:.0f} deg. "
-                            f"Yaw authority? Thruster failure?")
-
-            self.tick(self.turn_v, yaw_cmd)
-            turned += abs(wrap180(self.heading - prev))
-            prev = self.heading
-            self.log_every("uturn", 2.0, lambda: f"  turned {turned:5.1f} deg")
-        self.get_logger().info(f"U-turn complete, hdg {self.heading:.1f}")
-
-    def return_to_origin(self):
-        """Steer to the live bearing toward the launch point (so the u-turn's
-        lateral offset self-corrects), then continue RETURN_MARGIN metres
-        past the gate."""
-        self.enter("RETURN")
-        while True:
-            along, cross = self.along_cross()
-            if along <= -RETURN_MARGIN:
-                break
-
-            dx = self.origin[0] - self.pos[0]
-            dy = self.origin[1] - self.pos[1]
-            dist = math.hypot(dx, dy)
-
-            if dist > 1.0:
-                sp = math.degrees(math.atan2(dy, dx)) % 360.0
-            else:
-                # On top of the origin: just push through on the reciprocal.
-                sp = self.return_heading
-
-            # Once close to the gate, let vision centre us in it.
-            gb = self.gate_bearing()
-            if along < 6.0 and gb is not None:
-                sp = (self.heading + gb) % 360.0
-
-            self.tick(self.cruise_v, self.yaw_to(sp), z=Z_NEUTRAL)
-            self.log_every("return", 2.0, lambda: (
-                f"  along {along:+6.2f}  cross {cross:+5.2f}  "
-                f"dist {dist:5.2f}  sp {sp:6.1f}  hdg {self.heading:6.1f}"))
-        self.get_logger().info("Back through the gate.")
+        self.get_logger().info("At the gate.")
 
     # ---------------- failure ----------------
 
