@@ -24,6 +24,11 @@ drive somewhere absurd.
     ros2 run nautilus_auto qualify --ros-args -p dry_run:=true
     ros2 run nautilus_auto qualify --ros-args -p fake_gate:=true   # no camera needed
 
+Every console log line is mirrored to a plain text file (see _open_run_log)
+alongside the per-command CSV (see _open_cmd_log), both under CMD_LOG_DIR --
+a complete record of the run independent of console log level or terminal
+scrollback.
+
 PRE-FLIGHT: confirm in water that velocity_nucleus_x goes nonzero and
 fom_ins drops below ~5. On the bench it reads 0.0 / 44.9 and the position
 solution is meaningless. Run with require_bottom_lock:=true to hard-gate it.
@@ -49,7 +54,8 @@ from rosidl_runtime_py.utilities import get_message
 INS_TOPIC = "/nucleus_node/ins_packets"
 Z_NEUTRAL = 500.0   # ManualControl z: 500 = no vertical demand (ALT_HOLD)
 DT = 0.05           # 20 Hz control loop
-FAKE_GATE_SECONDS = 10.0   # fake_gate:=true fakes a solid gate for this long, once
+FAKE_GATE_SECONDS = 20.0   # fake_gate:=true fakes a solid gate for this long, once
+FAKE_GATE_START_RANGE = 8.0   # m: simulated range at the start of the fake window
 
 # Fixed tuning constants. These get set once from pool testing and rarely
 # change between runs -- edit them here rather than adding another ROS
@@ -61,6 +67,7 @@ VISION_TIMEOUT = 1.5          # s before a detection goes stale
 SETTLE_SECONDS = 3.0          # s of heading hold before driving
 GATE_OVERSHOOT = 2.5          # m of blind push once the gate leaves frame
 GATE_PASS_RANGE = 1.6         # m: closer than this, commit to passing
+GATE_LOST_STOP = 5.0          # s a lost gate may coast before stopping forward thrust
 SCAN_YAW = 150.0              # yaw demand while spinning in place looking for the gate
 SEARCH_TIMEOUT = 90.0         # s
 GATE_MIN_CONF = 0.20          # sanity floor at ARM time only
@@ -88,7 +95,7 @@ class Qualify(Node):
         d("dry_run", False)
         d("fake_gate", False)               # bench: fake a solid gate, no camera needed
         d("fake_gate_bearing_deg", 0.0)     # bearing to report while faking
-        d("fake_gate_range_m", 3.0)         # range to report while faking (range_ok=true)
+        d("fake_gate_range_m", 3.0)         # range simulated CLOSING to by the end of the window
         d("target_heading", float("nan"))   # NaN -> capture at arm
         d("cruise_speed", 0.35)             # thrust fraction while driving
         d("arm_delay", 5.0)                 # s between gate acquired and arming
@@ -139,6 +146,9 @@ class Qualify(Node):
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                          history=HistoryPolicy.KEEP_LAST, depth=10)
 
+        self._cmd_log = self._open_cmd_log()
+        self._run_log = self._open_run_log()
+
         self.create_subscription(State, "/mavros/state", self._on_state,
                                  self._match_qos("/mavros/state"))
         self.ctrl = self.create_publisher(ManualControl,
@@ -156,14 +166,15 @@ class Qualify(Node):
         self.state = None
         self.state_stamp = 0.0
         if self.dry_run:
-            self.get_logger().warn("DRY RUN: no arm, no thrust published.")
+            self._log("warn", "DRY RUN: no arm, no thrust published.")
         if self.fake_gate:
-            self.get_logger().warn(
-                f"FAKE_GATE: gate will be faked CONFIRMED at bearing "
-                f"{self.fake_bearing:+.1f} deg, range {self.fake_range:.1f}m, "
-                f"for {FAKE_GATE_SECONDS:.0f}s the first time it's checked.")
+            self._log("warn",
+                f"FAKE_GATE: gate faked CONFIRMED at bearing {self.fake_bearing:+.1f} deg, "
+                f"range simulated closing {FAKE_GATE_START_RANGE:.1f}m -> "
+                f"{self.fake_range:.1f}m over {FAKE_GATE_SECONDS:.0f}s, "
+                f"starting the first time it's checked.")
 
-        self._cmd_log = self._open_cmd_log()
+    # ---------------- logging ----------------
 
     def _open_cmd_log(self):
         """Every command this node ever sends (or would send, in dry_run)
@@ -179,15 +190,32 @@ class Qualify(Node):
         self.get_logger().info(f"command log: {path}")
         return f
 
+    def _open_run_log(self):
+        """Mirror of every get_logger() call this node makes, as plain text,
+        so the full run is on disk regardless of console log level or
+        terminal scrollback -- see _log()."""
+        path = os.path.join(os.path.expanduser(CMD_LOG_DIR),
+                            f"qualify_run_{time.strftime('%Y%m%d_%H%M%S')}.log")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        f = open(path, "w", buffering=1)
+        self.get_logger().info(f"run log: {path}")
+        return f
+
+    def _log(self, level, msg):
+        """Log through ROS (console) AND the plain-text run log file."""
+        getattr(self.get_logger(), level)(msg)
+        self._run_log.write(f"{time.time():.3f} [{level.upper():5s}] {self.phase:16s} {msg}\n")
+
     def _log_cmd(self, x, y, z, r):
         self._cmd_log.write(
             f"{time.time():.3f},{self.phase},{x:.1f},{y:.1f},{z:.1f},{r:.1f}\n")
 
-    def close_cmd_log(self):
-        try:
-            self._cmd_log.close()
-        except Exception:  # noqa: BLE001
-            pass
+    def close_logs(self):
+        for f in (self._cmd_log, self._run_log):
+            try:
+                f.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _match_qos(self, topic, timeout=8.0):
         """Mirror the publisher's QoS. A mismatched subscriber gets nothing,
@@ -197,7 +225,7 @@ class Qualify(Node):
             infos = self.get_publishers_info_by_topic(topic)
             if infos:
                 q = infos[0].qos_profile
-                self.get_logger().info(
+                self._log("info",
                     f"{topic}: matching pub QoS "
                     f"{q.reliability.name}/{q.durability.name}")
                 return QoSProfile(
@@ -206,7 +234,7 @@ class Qualify(Node):
                     history=HistoryPolicy.KEEP_LAST,
                     depth=10)
             rclpy.spin_once(self, timeout_sec=0.2)
-        self.get_logger().warn(f"{topic}: no publisher, using default QoS")
+        self._log("warn", f"{topic}: no publisher, using default QoS")
         return QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
                           durability=DurabilityPolicy.VOLATILE,
                           history=HistoryPolicy.KEEP_LAST, depth=10)
@@ -221,9 +249,9 @@ class Qualify(Node):
                     break
             rclpy.spin_once(self, timeout_sec=0.2)
         if not mt:
-            self.get_logger().fatal(f"{INS_TOPIC} absent. nautilus_up.sh running?")
+            self._log("fatal", f"{INS_TOPIC} absent. nautilus_up.sh running?")
             raise SystemExit(1)
-        self.get_logger().info(f"INS type: {mt}")
+        self._log("info", f"INS type: {mt}")
         self.create_subscription(get_message(mt), INS_TOPIC, self._on_ins, qos)
 
     # ---------------- callbacks ----------------
@@ -235,7 +263,7 @@ class Qualify(Node):
     def _on_abort(self, _msg):
         """Convenience kill, NOT a safety system -- the hardware kill switch
         is. ros2 topic pub --once /nautilus/cmd/abort std_msgs/msg/Empty {}"""
-        self.get_logger().warn("ABORT REQUESTED on /nautilus/cmd/abort")
+        self._log("warn", "ABORT REQUESTED on /nautilus/cmd/abort")
         self._abort_req = True
 
     def fcu_live(self):
@@ -267,12 +295,24 @@ class Qualify(Node):
         """The gate reading to use right now: fake_gate override (once, for
         FAKE_GATE_SECONDS, starting the first time this is called -- not at
         node startup, which could be tens of seconds before anyone cares)
-        or whatever's actually fresh from pipe_detector.py."""
+        or whatever's actually fresh from pipe_detector.py.
+
+        The faked range SIMULATES CLOSING from FAKE_GATE_START_RANGE down to
+        fake_gate_range_m over the window, rather than reporting the
+        configured range immediately. Reporting it immediately meant setting
+        fake_gate_range_m below GATE_PASS_RANGE made drive_to_gate() see
+        "close enough" on its very first tick and finish instantly -- it
+        never actually held/drove for the configured duration.
+        """
         if self.fake_gate:
             if self._fake_until is None:
                 self._fake_until = time.time() + FAKE_GATE_SECONDS
-            if time.time() < self._fake_until:
-                return {"bearing_deg": self.fake_bearing, "range_m": self.fake_range,
+            remaining = self._fake_until - time.time()
+            if remaining > 0:
+                frac = 1.0 - (remaining / FAKE_GATE_SECONDS)
+                start = max(FAKE_GATE_START_RANGE, self.fake_range)
+                sim_range = start + (self.fake_range - start) * frac
+                return {"bearing_deg": self.fake_bearing, "range_m": round(sim_range, 2),
                        "range_ok": True, "conf": 1.0, "confirmed": True}
 
         if not self._gate:
@@ -360,7 +400,7 @@ class Qualify(Node):
 
     def _call(self, cli, req, what):
         if not cli.wait_for_service(timeout_sec=5.0):
-            self.get_logger().error(f"{what}: service unavailable")
+            self._log("error", f"{what}: service unavailable")
             return None
         fut = cli.call_async(req)
         rclpy.spin_until_future_complete(self, fut, timeout_sec=5.0)
@@ -368,7 +408,7 @@ class Qualify(Node):
 
     def arm(self, value):
         if self.dry_run:
-            self.get_logger().info(f"[dry_run] arm({value})")
+            self._log("info", f"[dry_run] arm({value})")
             return True
         req = CommandBool.Request()
         req.value = value
@@ -380,7 +420,7 @@ class Qualify(Node):
 
     def set_mode(self, mode):
         if self.dry_run:
-            self.get_logger().info(f"[dry_run] set_mode({mode})")
+            self._log("info", f"[dry_run] set_mode({mode})")
             return True
         req = SetMode.Request()
         req.custom_mode = mode
@@ -415,20 +455,20 @@ class Qualify(Node):
             rclpy.spin_once(self, timeout_sec=0.05)
             if pred():
                 return True
-        self.get_logger().error(f"timeout waiting for {what}")
+        self._log("error", f"timeout waiting for {what}")
         return False
 
     def enter(self, phase):
         self.phase = phase
         self.reset_pi()
-        self.get_logger().info(f"=== {phase} ===")
+        self._log("info", f"=== {phase} ===")
 
     def log_every(self, key, interval, msg):
         """Throttled info log, shared by every phase's progress line."""
         now = time.time()
         if now - self._log_times.get(key, 0.0) > interval:
             self._log_times[key] = now
-            self.get_logger().info(msg())
+            self._log("info", msg())
 
     # ---------------- mission ----------------
 
@@ -436,14 +476,14 @@ class Qualify(Node):
         self.enter("WAIT_FCU")
         if not self.spin_until(self.fcu_live, 30.0, "a fresh connected:true"):
             if self.state is None:
-                self.get_logger().error(
+                self._log("error",
                     "no /mavros/state at all. Is MAVROS running? "
                     "pgrep -af mavros_node")
             elif not self.state.connected:
-                self.get_logger().error(
+                self._log("error",
                     "MAVROS up, FCU silent. Cube powered? TELEM2 harness?")
             else:
-                self.get_logger().error(
+                self._log("error",
                     "connected:true but STALE - that is a latched message "
                     "from a dead MAVROS. Check: ros2 topic hz /mavros/state")
             return 1
@@ -452,32 +492,32 @@ class Qualify(Node):
         if not self.spin_until(lambda: self.pos is not None, 20.0, "INS"):
             return 1
 
-        self.get_logger().info(
+        self._log("info",
             f"hdg {self.heading:.1f}  fom_ins {self.fom_ins:.1f}  "
-            f"vel_x {self.vel_x:.3f}")
+            f"vel_x {self.vel_x:.3f}  pos {self.pos[0]:.2f},{self.pos[1]:.2f}")
         if self.fom_ins > self.max_fom:
             msg = (f"fom_ins={self.fom_ins:.1f} > {self.max_fom} - no bottom "
                    f"lock. Dead reckoning will drift.")
             if self.require_lock:
-                self.get_logger().fatal(msg)
+                self._log("fatal", msg)
                 return 1
-            self.get_logger().warn(msg + " Proceeding anyway.")
+            self._log("warn", msg + " Proceeding anyway.")
 
         if not self.wait_for_gate():
             return 1
 
         if math.isnan(self.gate_heading):
             self.gate_heading = self.heading
-            self.get_logger().info(f"Gate heading CAPTURED: {self.gate_heading:.1f}")
+            self._log("info", f"Gate heading CAPTURED: {self.gate_heading:.1f}")
         self.origin = self.pos
 
         self.enter("ARM")
         self.neutral()
         if not self.arm(True):
-            self.get_logger().fatal("arm rejected (SYSID_MYGCS=1?)")
+            self._log("fatal", "arm rejected (SYSID_MYGCS=1?)")
             return 1
         if not self.set_mode("ALT_HOLD"):
-            self.get_logger().fatal("mode rejected")
+            self._log("fatal", "mode rejected")
             self.arm(False)
             return 1
 
@@ -492,7 +532,7 @@ class Qualify(Node):
             self.neutral()
             rclpy.spin_once(self, timeout_sec=DT)
         self.arm(False)
-        self.get_logger().info("Run complete.")
+        self._log("info", "Run complete.")
         return 0
 
     def wait_for_gate(self):
@@ -502,23 +542,23 @@ class Qualify(Node):
         aiming at. skip_gate_wait bypasses this on the bench."""
         self.enter("WAIT_GATE")
         if bool(self.get_parameter("skip_gate_wait").value):
-            self.get_logger().warn("skip_gate_wait: arming without a gate.")
+            self._log("warn", "skip_gate_wait: arming without a gate.")
             self.mission_start = time.time()
             return True
 
         forever = self.acquire_timeout <= 0.0
         deadline = None if forever else time.time() + self.acquire_timeout
         if forever:
-            self.get_logger().info(
+            self._log("info",
                 "Waiting indefinitely for the gate. Disarmed, no thrust. "
                 "Ctrl+C or /nautilus/cmd/abort to stop.")
 
         while rclpy.ok():
             if self._abort_req:
-                self.get_logger().error("Aborted before arming.")
+                self._log("error", "Aborted before arming.")
                 return False
             if deadline and time.time() > deadline:
-                self.get_logger().error("Gate never appeared. Not arming.")
+                self._log("error", "Gate never appeared. Not arming.")
                 return False
 
             rclpy.spin_once(self, timeout_sec=0.05)
@@ -528,8 +568,10 @@ class Qualify(Node):
             def _status():
                 left = "" if forever else f"  ({deadline - time.time():.0f}s left)"
                 b = self.gate_bearing()
+                rng, ok = self.gate_range()
                 why = "none" if b is None else f"weak (conf {self.gate_conf():.2f})"
-                return (f"  waiting for gate [{why}]  hdg {self.heading:.1f}  "
+                return (f"  waiting for gate [{why}]  bearing {b}  "
+                       f"range {rng if ok else '--'}  hdg {self.heading:.1f}  "
                        f"fom {self.fom_ins:.1f}{left}")
             self.log_every("wait_gate", 5.0, _status)
         else:
@@ -537,7 +579,7 @@ class Qualify(Node):
 
         b = self.gate_bearing()
         rng, ok = self.gate_range()
-        self.get_logger().warn(
+        self._log("warn",
             f"GATE ACQUIRED: bearing {b:+.1f}, range {rng if ok else 'far'}. "
             f"ARMING IN {self.arm_delay:.0f}s -- HANDS OFF.")
 
@@ -546,11 +588,11 @@ class Qualify(Node):
         while time.time() < t_end:
             rclpy.spin_once(self, timeout_sec=0.1)
             if self._abort_req:
-                self.get_logger().error("Aborted during arm countdown.")
+                self._log("error", "Aborted during arm countdown.")
                 return False
             remain = t_end - time.time()
             if remain > 0 and abs(remain - round(remain)) < 0.06:
-                self.get_logger().warn(f"  arming in {round(remain)}...")
+                self._log("warn", f"  arming in {round(remain)}...")
 
         self.mission_start = time.time()
         return True
@@ -563,7 +605,7 @@ class Qualify(Node):
         flip = time.time() + 8.0
         while time.time() < end:
             if seen():
-                self.get_logger().info(f"{what} reacquired.")
+                self._log("info", f"{what} reacquired.")
                 return
             if time.time() > flip:
                 direction *= -1.0
@@ -592,11 +634,16 @@ class Qualify(Node):
     def drive_to_gate(self):
         """Look for the gate, then move toward it based on the tracked
         state. Gate visible -> drive at it, steering on its live bearing.
-        Gate not seen -> zero forward thrust, spin in place looking for it.
-        Losing the gate briefly is normal (a wave, a bubble, a bad frame)
-        and just pauses advance; only an extended loss triggers an active
-        search, which aborts the run if it times out."""
+
+        Never seen it at all yet -> stop and actively search (spin in
+        place), aborting if that search times out. Seen it before and lost
+        it now -> keep pushing forward on the last known heading for up to
+        GATE_LOST_STOP seconds (a wave, a bubble, a bad frame, the vehicle
+        now being too close to keep it in frame); past that, stop driving
+        forward and just hold heading until it reappears (or the mission
+        clock / an abort ends things)."""
         self.enter("DRIVE_TO_GATE")
+        ever_seen = False
         lost_since = None
 
         while True:
@@ -608,36 +655,43 @@ class Qualify(Node):
             rng, ok = self.gate_range()
 
             if b is None:
+                if not ever_seen:
+                    self.search(lambda: self.gate_bearing() is not None, "gate")
+                    continue
                 if lost_since is None:
                     lost_since = time.time()
-                elif time.time() - lost_since > 3.0:
-                    self.search(lambda: self.gate_bearing() is not None, "gate")
-                    lost_since = None
-                    continue
-                self.tick(0.0, self.yaw_to(self.gate_heading))
+                lost_for = time.time() - lost_since
+                if lost_for > GATE_LOST_STOP:
+                    state = f"stopped (lost {lost_for:.1f}s)"
+                    self.tick(0.0, self.yaw_to(self.gate_heading))
+                else:
+                    state = f"coasting (lost {lost_for:.1f}s)"
+                    self.tick(self.cruise_v, self.yaw_to(self.gate_heading), z=Z_NEUTRAL)
             else:
+                ever_seen = True
                 lost_since = None
+                state = "driving"
                 sp = (self.heading + b) % 360.0   # centring > heading here
                 self.tick(self.cruise_v, self.yaw_to(sp), z=Z_NEUTRAL)
                 if ok and rng < GATE_PASS_RANGE:
                     break
 
             self.log_every("drive_to_gate", 2.0, lambda: (
-                f"  gate b {b if b is None else round(b,1)}  "
+                f"  [{state}]  gate b {b if b is None else round(b,1)}  "
                 f"r {rng if ok else '--'}  conf {self.gate_conf():.2f}  "
-                f"along {along:+.2f}"))
+                f"along {along:+.2f}  hdg {self.heading:.1f}"))
 
-        self.get_logger().info(f"Gate at {rng:.2f}m. Pushing through.")
+        self._log("info", f"Gate at {rng:.2f}m. Pushing through.")
         # Our heading right now IS the true gate normal -- better than the
         # heading captured on the surface.
         self.gate_heading = self.heading
         self.blind_push(self.gate_heading, GATE_OVERSHOOT)
-        self.get_logger().info("At the gate.")
+        self._log("info", "At the gate.")
 
     # ---------------- failure ----------------
 
     def abort(self, why):
-        self.get_logger().error(f"ABORT in {self.phase}: {why}")
+        self._log("error", f"ABORT in {self.phase}: {why}")
         for _ in range(10):
             self.neutral()
             time.sleep(DT)
@@ -651,7 +705,7 @@ class Qualify(Node):
         FS_PILOT_TIMEOUT=1.0 on the FCU; this is a convenience on top."""
         if self.dry_run or not self.armed_by_us:
             return
-        self.get_logger().warn("shutdown while armed - neutral + disarm")
+        self._log("warn", "shutdown while armed - neutral + disarm")
 
         # Zeros first, directly on the publisher: no spinning, no services,
         # nothing that can block. Publish many times since UDP drops packets.
@@ -665,13 +719,13 @@ class Qualify(Node):
         for attempt in range(3):
             try:
                 if self.arm(False):
-                    self.get_logger().warn("disarmed")
+                    self._log("warn", "disarmed")
                     return
             except Exception as e:  # noqa: BLE001
-                self.get_logger().error(f"disarm attempt {attempt+1}: {e}")
+                self._log("error", f"disarm attempt {attempt+1}: {e}")
             time.sleep(0.3)
 
-        self.get_logger().error(
+        self._log("error",
             "COULD NOT DISARM. Hit the hardware kill switch. "
             "Then: ros2 service call /mavros/cmd/arming "
             "mavros_msgs/srv/CommandBool \"{value: false}\"")
@@ -712,7 +766,7 @@ def main():
         node.get_logger().fatal(f"unhandled: {e}")
         node.safe_shutdown()
     finally:
-        node.close_cmd_log()
+        node.close_logs()
         node.destroy_node()
         rclpy.shutdown()
     return rc
