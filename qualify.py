@@ -49,7 +49,7 @@ from rosidl_runtime_py.utilities import get_message
 INS_TOPIC = "/nucleus_node/ins_packets"
 Z_NEUTRAL = 500.0   # ManualControl z: 500 = no vertical demand (ALT_HOLD)
 DT = 0.05           # 20 Hz control loop
-FAKE_GATE_SECONDS = 2.0   # fake_gate:=true fakes a solid gate for this long, once
+FAKE_GATE_SECONDS = 10.0   # fake_gate:=true fakes a solid gate for this long, once
 
 # Fixed tuning constants. These get set once from pool testing and rarely
 # change between runs -- edit them here rather than adding another ROS
@@ -87,6 +87,8 @@ class Qualify(Node):
         d = self.declare_parameter
         d("dry_run", False)
         d("fake_gate", False)               # bench: fake a solid gate, no camera needed
+        d("fake_gate_bearing_deg", 0.0)     # bearing to report while faking
+        d("fake_gate_range_m", 3.0)         # range to report while faking (range_ok=true)
         d("target_heading", float("nan"))   # NaN -> capture at arm
         d("cruise_speed", 0.35)             # thrust fraction while driving
         d("arm_delay", 5.0)                 # s between gate acquired and arming
@@ -99,6 +101,8 @@ class Qualify(Node):
         g = lambda n: self.get_parameter(n).value
         self.dry_run = bool(g("dry_run"))
         self.fake_gate = bool(g("fake_gate"))
+        self.fake_bearing = float(g("fake_gate_bearing_deg"))
+        self.fake_range = float(g("fake_gate_range_m"))
         self.gate_heading = float(g("target_heading"))
         self.cruise_v = float(g("cruise_speed")) * 1000.0
         self.arm_delay = float(g("arm_delay"))
@@ -155,8 +159,9 @@ class Qualify(Node):
             self.get_logger().warn("DRY RUN: no arm, no thrust published.")
         if self.fake_gate:
             self.get_logger().warn(
-                f"FAKE_GATE: gate will be faked CONFIRMED, dead ahead, for "
-                f"{FAKE_GATE_SECONDS:.0f}s the first time it's checked.")
+                f"FAKE_GATE: gate will be faked CONFIRMED at bearing "
+                f"{self.fake_bearing:+.1f} deg, range {self.fake_range:.1f}m, "
+                f"for {FAKE_GATE_SECONDS:.0f}s the first time it's checked.")
 
         self._cmd_log = self._open_cmd_log()
 
@@ -267,8 +272,8 @@ class Qualify(Node):
             if self._fake_until is None:
                 self._fake_until = time.time() + FAKE_GATE_SECONDS
             if time.time() < self._fake_until:
-                return {"bearing_deg": 0.0, "range_m": 0.0, "range_ok": False,
-                       "conf": 1.0, "confirmed": True}
+                return {"bearing_deg": self.fake_bearing, "range_m": self.fake_range,
+                       "range_ok": True, "conf": 1.0, "confirmed": True}
 
         if not self._gate:
             return None
