@@ -69,12 +69,12 @@ FAKE_GATE_SECONDS = 20.0   # fake_gate:=true fakes a solid gate for this long, o
 FAKE_GATE_START_RANGE = 8.0   # m: simulated range at the start of the fake window
 
 # SEEK_ALTITUDE (the one exception to "no depth logic" -- see module docstring)
-TARGET_ALTITUDE_M = 0.5       # m above the pool floor to reach before SETTLE
+TARGET_ALTITUDE_M = 0.0      # m above the pool floor to reach before SETTLE
 ALTITUDE_TOLERANCE_M = 0.1    # m: within this band of target counts as "there"
 ALTITUDE_KP = 150.0           # z units per metre of error -- gentle; verify in pool
 ALTITUDE_Z_MAX = 80.0         # z units off neutral, hard cap (of the 0-1000 range)
 ALTITUDE_TIMEOUT = 30.0       # s to reach target before aborting
-ALTITUDE_MIN_SAFE_M = 0.2     # m: abort immediately this close to the floor, no matter what
+ALTITUDE_MIN_SAFE_M = 0.0  # m: abort immediately this close to the floor, no matter what
 ALTITUDE_SIGN = 1.0           # UNVERIFIED direction -- flip to -1.0 if it moves the wrong way
 
 # Fixed tuning constants. These get set once from pool testing and rarely
