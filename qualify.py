@@ -685,6 +685,14 @@ class Qualify(Node):
         (shrinking when it should grow, or vice versa), flip ALTITUDE_SIGN.
         ALTITUDE_MIN_SAFE_M aborts immediately regardless of that -- if the
         floor gets too close for any reason, stop before asking questions.
+
+        x and r are pinned to 0.0 for the entire phase -- no forward thrust,
+        no yaw correction, ever. This phase only ever commands z.
+
+        A stale altimeter reading does NOT abort the run: it holds neutral
+        z (never drives on a number that might be old) and waits for a
+        fresh one. Only ALTITUDE_TIMEOUT overall, or the safety floor, can
+        end this phase early.
         """
         self.enter("SEEK_ALTITUDE")
         if not self.spin_until(lambda: self.altimeter_distance is not None,
@@ -693,10 +701,19 @@ class Qualify(Node):
 
         end = time.time() + ALTITUDE_TIMEOUT
         while True:
+            if time.time() > end:
+                raise Abort(f"could not reach {TARGET_ALTITUDE_M:.2f}m altitude in "
+                            f"{ALTITUDE_TIMEOUT:.0f}s")
+
             alt = self.altimeter_distance
             age = time.time() - self.altimeter_stamp
             if age > INS_TIMEOUT:
-                raise Abort(f"altimeter stale ({age:.1f}s old) -- cannot seek altitude")
+                self.log_every("seek_altitude_stale", 1.0, lambda: (
+                    f"  altimeter stale ({age:.2f}s old, last reading {alt:.2f}m) "
+                    f"-- holding, waiting for a fresh one"))
+                self.tick(0.0, 0.0, z=Z_NEUTRAL)   # never act on a possibly-stale number
+                continue
+
             if alt < ALTITUDE_MIN_SAFE_M:
                 raise Abort(f"altimeter {alt:.2f}m < {ALTITUDE_MIN_SAFE_M}m safety floor")
 
@@ -707,10 +724,6 @@ class Qualify(Node):
                     f"(within {ALTITUDE_TOLERANCE_M:.2f}m). Holding here.")
                 self.publish(0.0, 0.0, z=Z_NEUTRAL)
                 return
-            if time.time() > end:
-                raise Abort(f"could not reach {TARGET_ALTITUDE_M:.2f}m altitude in "
-                            f"{ALTITUDE_TIMEOUT:.0f}s (stuck at {alt:.2f}m, "
-                            f"error {error:+.2f}m)")
 
             z = clamp(Z_NEUTRAL + ALTITUDE_SIGN * ALTITUDE_KP * error,
                      Z_NEUTRAL - ALTITUDE_Z_MAX, Z_NEUTRAL + ALTITUDE_Z_MAX)
