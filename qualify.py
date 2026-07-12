@@ -33,6 +33,7 @@ solution is meaningless. Run with require_bottom_lock:=true to hard-gate it.
 
 import json
 import math
+import os
 import signal
 import sys
 import time
@@ -102,6 +103,7 @@ class Qualify(Node):
         d("startup_delay", 0.0)       # s to sit still after launch
         d("skip_gate_wait", False)    # bench only: arm without seeing a gate
         d("dry_run", False)
+        d("cmd_log_dir", "~/nautilus_ws/logs")   # every command actually sent, csv
 
         g = lambda n: self.get_parameter(n).value
         self.pole_d_max = float(g("pole_distance_max"))
@@ -183,6 +185,33 @@ class Qualify(Node):
         self.state_stamp = 0.0
         if self.dry_run:
             self.get_logger().warn("DRY RUN: no arm, no thrust published.")
+
+        self._cmd_log = self._open_cmd_log(str(g("cmd_log_dir")))
+
+    def _open_cmd_log(self, log_dir):
+        """Every command this node ever sends (or would send, in dry_run)
+        goes here as it's published -- x/y/z/r, post-clamp, with the phase
+        active at the time. This is the actual record of what moved the
+        vehicle, independent of console log level or whether a bag was
+        recording /mavros/manual_control/send.
+        """
+        path = os.path.join(os.path.expanduser(log_dir),
+                            f"qualify_cmds_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        f = open(path, "w", buffering=1)   # line-buffered: survives a crash
+        f.write("t,phase,x,y,z,r\n")
+        self.get_logger().info(f"command log: {path}")
+        return f
+
+    def _log_cmd(self, x, y, z, r):
+        self._cmd_log.write(
+            f"{time.time():.3f},{self.phase},{x:.1f},{y:.1f},{z:.1f},{r:.1f}\n")
+
+    def close_cmd_log(self):
+        try:
+            self._cmd_log.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _match_qos(self, topic, timeout=8.0):
         """Mirror the publisher's QoS. A mismatched subscriber gets nothing,
@@ -343,6 +372,7 @@ class Qualify(Node):
         m.z = float(clamp(z, 0, 1000))
         m.r = float(clamp(r, -1000, 1000))
         m.buttons = 0
+        self._log_cmd(m.x, m.y, m.z, m.r)   # log even in dry_run: what WOULD move
         if not self.dry_run:
             self.ctrl.publish(m)
 
@@ -833,6 +863,7 @@ def main():
         node.get_logger().fatal(f"unhandled: {e}")
         node.safe_shutdown()
     finally:
+        node.close_cmd_log()
         node.destroy_node()
         rclpy.shutdown()
     return rc
