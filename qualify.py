@@ -14,13 +14,24 @@ until the vehicle is TARGET_ALTITUDE_M above the pool floor, then switches
 back to ALT_HOLD before anything else runs. Every other phase never
 touches z, and ALT_HOLD does the actual holding for the rest of the run.
 
-SEEK_ALTITUDE's z-direction (ALTITUDE_SIGN) is UNVERIFIED -- whether raising
-z moves the vehicle up or down is an ArduSub/wiring convention this code
-does not know. Watch the first run with the vehicle well clear of the
-floor; if altimeter_distance moves the WRONG way, flip ALTITUDE_SIGN.
-ALTITUDE_MIN_SAFE_M is a hard abort independent of that: if the floor gets
-too close for any reason, it stops immediately regardless of which
-direction was intended.
+SEEK_ALTITUDE's z-direction (altitude_sign param, default ALTITUDE_SIGN) is
+UNVERIFIED -- whether raising z moves the vehicle up or down is an
+ArduSub/wiring convention this code does not know. Watch the first run with
+the vehicle well clear of the floor; if altimeter_distance moves the WRONG
+way, pass -p altitude_sign:=-1.0 (no rebuild needed) and rerun.
+
+Two independent backstops guard against a wrong sign actually reaching the
+floor. altitude_min_safe_m is a hard abort on the raw altimeter reading,
+checked every tick, regardless of which direction was intended or how
+aggressive the gains are -- it does NOT depend on altitude_sign being
+right, which is exactly why it must be set with real margin for your pool
+and never left at 0 (0 never actually trips: the altimeter would have to
+read a negative distance, i.e. the vehicle is already through the floor).
+Separately, seek_altitude() tracks whether the altitude error is shrinking
+or growing over each ALTITUDE_STALL_CHECK_S window; growing while z is well
+off neutral is the signature of a backwards sign, and that aborts
+immediately instead of continuing to lean into it for the full
+ALTITUDE_TIMEOUT.
 
 Vision (pipe_detector.py, /nautilus/detections) owns WHERE the gate is; the
 drive phase never terminates on a dead-reckoned distance, only on actually
@@ -34,8 +45,29 @@ it's corroborated by everything before it).
 The INS owns heading and supplies the sanity bounds that abort the run if we
 drive somewhere absurd.
 
+sim_sensors:=true fabricates FCU/INS/altimeter data too, so the whole state
+machine (WAIT_FCU -> ... -> SEEK_ALTITUDE -> SETTLE -> DRIVE_TO_GATE ->
+DISARM) can be run above water with nothing else launched -- no MAVROS, no
+nucleus_node, no pipe_detector. A free-running timer (_sim_tick) integrates
+whatever this node last actually commanded (see publish()) against a fixed,
+made-up ground truth (SIM_ALT_TRUTH_SIGN) for which way z moves the
+simulated vehicle, and fake_gate (independent flag, turn it on too) covers
+vision. This proves the SEQUENCING and the abort/safety LOGIC -- including
+that the SEEK_ALTITUDE backstops above actually fire -- end to end on the
+bench. It proves NOTHING about which way the real vehicle's z channel
+actually moves, or about real gains, real noise, or a real DVL's bottom
+lock: only a real pool run with the vehicle clear of the floor verifies
+altitude_sign. sim_sensors forces dry_run on; it must never drive a real
+vehicle.
+
     ros2 run nautilus_auto qualify --ros-args -p dry_run:=true
     ros2 run nautilus_auto qualify --ros-args -p fake_gate:=true   # no camera needed
+    ros2 run nautilus_auto qualify --ros-args -p target_altitude_m:=0.6 -p altitude_sign:=-1.0
+    ros2 run nautilus_auto qualify --ros-args -p sim_sensors:=true -p fake_gate:=true -p fake_gate_range_m:=1.0
+        # bench, above water, nothing else running. fake_gate_range_m must be
+        # below GATE_PASS_RANGE (1.6) or the simulated gate never closes
+        # enough to finish drive_to_gate() -- expect ~15-20s to reach it,
+        # that's FAKE_GATE_SECONDS playing out, not a hang.
 
 Every console log line is mirrored to a plain text file (see _open_run_log)
 alongside the per-command CSV (see _open_cmd_log), both under CMD_LOG_DIR --
@@ -45,6 +77,9 @@ scrollback.
 PRE-FLIGHT: confirm in water that velocity_nucleus_x goes nonzero and
 fom_ins drops below ~5. On the bench it reads 0.0 / 44.9 and the position
 solution is meaningless. Run with require_bottom_lock:=true to hard-gate it.
+Also watch raw altimeter_distance against known pool depth for a bit before
+trusting SEEK_ALTITUDE at all -- garbage in is garbage out no matter how
+altitude_sign and altitude_min_safe_m are set.
 """
 
 import json
@@ -72,6 +107,9 @@ FAKE_GATE_SECONDS = 20.0   # fake_gate:=true fakes a solid gate for this long, o
 FAKE_GATE_START_RANGE = 8.0   # m: simulated range at the start of the fake window
 
 # SEEK_ALTITUDE (the one exception to "no depth logic" -- see module docstring)
+# target_altitude_m / altitude_sign / altitude_min_safe_m are also exposed as
+# ROS parameters of the same name (see __init__) so they can be changed
+# poolside without a rebuild -- these constants are just their defaults.
 TARGET_ALTITUDE_M = 0.5      # m above the pool floor to reach before SETTLE
 ALTITUDE_TOLERANCE_M = 0.1    # m: within this band of target counts as "there"
 ALTITUDE_KP = 300.0           # z units per metre of error -- verify in pool
@@ -83,10 +121,46 @@ ALTIMETER_TIMEOUT = 3.0       # s: altimeter reports in pulses, not continuously
                               # this must be looser than INS_TIMEOUT or every gap
                               # between pulses reads as "stale" and the z command
                               # pulses on/off in lockstep with the sensor.
-ALTITUDE_MIN_SAFE_M = 0.0  # m: abort immediately this close to the floor, no matter what
+ALTITUDE_MIN_SAFE_M = 0.3  # m: abort immediately this close to the floor, no matter what.
+                           # THE ONE CHECK THAT DOES NOT DEPEND ON altitude_sign BEING
+                           # RIGHT. Was 0.0, which never actually tripped (the altimeter
+                           # would have to read a negative distance) -- that's how a
+                           # prior run drove straight to the pool bottom instead of
+                           # stopping. 0.3 is a placeholder: set this from your actual
+                           # pool depth / vehicle draft with real margin, and keep it
+                           # comfortably below target_altitude_m.
 ALTITUDE_SIGN = 1.0           # UNVERIFIED direction -- flip to -1.0 if it moves the wrong way
-ALTITUDE_STALL_CHECK_S = 8.0   # s: window to judge "is it actually moving"
+ALTITUDE_STALL_CHECK_S = 8.0   # s: window to judge "is it actually moving" (and,
+                               # now, moving the right way -- see seek_altitude)
 ALTITUDE_STALL_MIN_MOVE_M = 0.03   # m: less than this over the window counts as stalled
+ALTITUDE_DIVERGE_M = 0.15     # m: if the altitude error gets this much WORSE (not
+                              # better) over one ALTITUDE_STALL_CHECK_S window while z
+                              # is meaningfully off neutral, that's a backwards
+                              # altitude_sign, not noise -- abort rather than continue
+
+FT_TO_M = 0.3048
+POOL_DEPTH_FT = 5.0        # ft: THIS TEST's pool depth. Normal/competition pool is
+                           # 7 ft -- change this back (or pass -p pool_depth_ft:=7.0)
+                           # before a non-test run. Also a ROS parameter (see
+                           # __init__). Used only as an upper sanity bound on raw
+                           # altimeter readings in _on_altimeter: the vehicle
+                           # physically cannot be deeper than the pool it's in, so
+                           # anything past that is bad data, not a bad sign/gain.
+POOL_DEPTH_SLACK_M = 0.3   # m: margin added on top of pool_depth_m before rejecting
+                           # a reading -- the depth figure above is a rough number,
+                           # not a survey, and a tilted vehicle reads a bit long.
+
+# sim_sensors (bench testing only -- see module docstring and _sim_tick).
+# These calibrate a fake plant so the state machine has something to
+# converge against; they are NOT a claim about the real vehicle.
+SIM_MAX_SPEED_MPS = 0.5     # m/s of simulated forward speed at full cruise thrust
+SIM_MAX_CLIMB_MPS = 0.3     # m/s of simulated altitude change at full commanded z authority
+SIM_ALT_TRUTH_SIGN = 1.0    # the simulator's OWN made-up ground truth for which way z
+                            # moves the simulated vehicle. Arbitrary, exists only to
+                            # give SEEK_ALTITUDE's logic something consistent to
+                            # converge (or, with altitude_sign flipped, diverge and
+                            # abort) against. Tells you NOTHING about which way the
+                            # real vehicle's z channel moves.
 
 # Fixed tuning constants. These get set once from pool testing and rarely
 # change between runs -- edit them here rather than adding another ROS
@@ -121,6 +195,11 @@ class Qualify(Node):
 
     def __init__(self):
         super().__init__("qualify")
+        # Printed straight away, before parameters/topics/log files are even
+        # set up, so a dry run (or a bench run with nothing else hooked up)
+        # proves the process is alive immediately instead of going silent
+        # for however long topic/service waits below take.
+        self.get_logger().info("qualify.py started")
 
         d = self.declare_parameter
         d("dry_run", False)
@@ -128,6 +207,8 @@ class Qualify(Node):
                                              # default ON; pass fake_gate:=false for a real run
         d("fake_gate_bearing_deg", 0.0)     # bearing to report while faking
         d("fake_gate_range_m", 3.0)         # range simulated CLOSING to by the end of the window
+        d("sim_sensors", False)             # bench: fabricate FCU/INS/altimeter too, no other
+                                             # nodes needed (see module docstring). Forces dry_run.
         d("target_heading", float("nan"))   # NaN -> capture at arm
         d("cruise_speed", 0.35)             # thrust fraction while driving
         d("arm_delay", 5.0)                 # s between gate acquired and arming
@@ -136,12 +217,19 @@ class Qualify(Node):
         d("skip_gate_wait", False)          # bench only: arm without seeing a gate
         d("require_bottom_lock", False)     # hard-gate on DVL bottom lock at launch
         d("max_fom_ins", 10.0)              # only enforced if require_bottom_lock
+        d("target_altitude_m", TARGET_ALTITUDE_M)     # m above floor to reach before SETTLE
+        d("altitude_sign", ALTITUDE_SIGN)             # UNVERIFIED direction -- see module docstring
+        d("altitude_min_safe_m", ALTITUDE_MIN_SAFE_M)  # hard abort floor -- size to the real pool
+        d("pool_depth_ft", POOL_DEPTH_FT)             # ft: sanity ceiling for altimeter readings
 
         g = lambda n: self.get_parameter(n).value
         self.dry_run = bool(g("dry_run"))
         self.fake_gate = bool(g("fake_gate"))
         self.fake_bearing = float(g("fake_gate_bearing_deg"))
         self.fake_range = float(g("fake_gate_range_m"))
+        self.sim_sensors = bool(g("sim_sensors"))
+        if self.sim_sensors and not self.dry_run:
+            self.dry_run = True   # sim_sensors must never drive a real vehicle -- warning logged below
         self.gate_heading = float(g("target_heading"))
         self.cruise_v = float(g("cruise_speed")) * 1000.0
         self.arm_delay = float(g("arm_delay"))
@@ -149,18 +237,30 @@ class Qualify(Node):
         self.acquire_timeout = float(g("gate_acquire_timeout"))
         self.require_lock = bool(g("require_bottom_lock"))
         self.max_fom = float(g("max_fom_ins"))
+        self.target_altitude_m = float(g("target_altitude_m"))
+        self.altitude_sign = float(g("altitude_sign"))
+        self.altitude_min_safe_m = float(g("altitude_min_safe_m"))
+        self.pool_depth_m = float(g("pool_depth_ft")) * FT_TO_M
         self._fake_until = None   # lazily set on first gate check, not at startup
 
-        # INS state
-        self.heading = None
-        self.pos = None          # (x, y) in INS frame
+        # INS state. Under sim_sensors these are seeded live (not None/0)
+        # since no real _on_ins will ever arrive to populate them, and kept
+        # fresh afterward by the _sim_tick timer set up below.
+        self.heading = 0.0 if self.sim_sensors else None
+        self.pos = (0.0, 0.0) if self.sim_sensors else None   # (x, y) in INS frame
         self.vel_x = 0.0
-        self.fom_ins = 999.0
-        self.ins_stamp = 0.0
+        self.fom_ins = 1.0 if self.sim_sensors else 999.0
+        self.ins_stamp = time.time() if self.sim_sensors else 0.0
 
-        # Altimeter state (SEEK_ALTITUDE only)
-        self.altimeter_distance = None
-        self.altimeter_stamp = 0.0
+        # Altimeter state (SEEK_ALTITUDE only). Seeded near the surface under
+        # sim_sensors (pool depth minus a little headroom, not pool depth
+        # exactly) -- i.e. the simulated vehicle starts close to the top of
+        # the water column. The headroom matters: seeded AT the ceiling,
+        # _sim_tick's clamp would pin a wrong-direction test flat instead of
+        # showing the error actually growing, masking the exact divergence
+        # the ALTITUDE_DIVERGE_M check exists to catch.
+        self.altimeter_distance = max(0.0, self.pool_depth_m - 0.5) if self.sim_sensors else None
+        self.altimeter_stamp = time.time() if self.sim_sensors else 0.0
 
         # Mission frame: origin + axis latched at arm
         self.origin = None
@@ -185,12 +285,14 @@ class Qualify(Node):
         self._cmd_log = self._open_cmd_log()
         self._run_log = self._open_run_log()
 
-        self.create_subscription(State, "/mavros/state", self._on_state,
-                                 self._match_qos("/mavros/state"))
+        if not self.sim_sensors:
+            self.create_subscription(State, "/mavros/state", self._on_state,
+                                     self._match_qos("/mavros/state"))
         self.ctrl = self.create_publisher(ManualControl,
                                           "/mavros/manual_control/send", 10)
-        self._subscribe_ins(qos)
-        self._subscribe_altimeter(qos)
+        if not self.sim_sensors:
+            self._subscribe_ins(qos)
+            self._subscribe_altimeter(qos)
         self.create_subscription(String, "/nautilus/detections",
                                  self._on_detections, 10)
         self.create_subscription(Empty, "/nautilus/cmd/abort",
@@ -202,8 +304,26 @@ class Qualify(Node):
 
         self.state = None
         self.state_stamp = 0.0
+
+        # sim_sensors: a free-running timer, not tied to any particular
+        # phase's tick() calls, so INS/altimeter stay fresh no matter which
+        # blocking wait loop is currently spinning (see _sim_tick).
+        self._last_cmd = (0.0, 0.0, Z_NEUTRAL)
+        if self.sim_sensors:
+            self._sim_last_t = time.time()
+            self.create_timer(DT, self._sim_tick)
+
         if self.dry_run:
             self._log("warn", "DRY RUN: no arm, no thrust published.")
+        if self.sim_sensors:
+            self._log("warn",
+                "SIM_SENSORS: FCU/INS/altimeter are all synthetic, integrated from "
+                "this node's own commands against a made-up ground truth -- no "
+                "MAVROS/nucleus_node/pipe_detector needed. This exercises the STATE "
+                "MACHINE and the abort/safety LOGIC end to end; it proves NOTHING "
+                "about altitude_sign or any other real-world direction or gain. "
+                "Only a real pool run with the vehicle clear of the floor verifies "
+                "that.")
         if self.fake_gate:
             self._log("warn",
                 f"FAKE_GATE: gate faked CONFIRMED at bearing {self.fake_bearing:+.1f} deg, "
@@ -336,6 +456,8 @@ class Qualify(Node):
     def fcu_live(self):
         """connected:true AND recent. /mavros/state is latched, so a stale
         "connected:true" from a dead MAVROS must not be trusted."""
+        if self.sim_sensors:
+            return True
         if self.state is None or not self.state.connected:
             return False
         hdr = self.state.header.stamp
@@ -351,8 +473,60 @@ class Qualify(Node):
         self.ins_stamp = time.time()
 
     def _on_altimeter(self, m):
-        self.altimeter_distance = float(m.altimeter_distance)
+        d = float(m.altimeter_distance)
+        if not math.isfinite(d) or d < 0.0 or d > self.pool_depth_m + POOL_DEPTH_SLACK_M:
+            # Drop it and leave altimeter_distance/stamp untouched -- a bad
+            # sample (or a run of them) just ages into the existing "stale,
+            # hold neutral" handling in seek_altitude() instead of being
+            # acted on directly. Not confident the nucleus is clean, so
+            # don't trust a single reading blindly -- and it physically
+            # cannot read deeper than the pool it's in.
+            self.log_every("altimeter_bad", 2.0, lambda: (
+                f"  ignoring implausible altimeter reading: {d:.2f}m "
+                f"(pool_depth_m {self.pool_depth_m:.2f})"))
+            return
+        self.altimeter_distance = d
         self.altimeter_stamp = time.time()
+
+    def _sim_tick(self):
+        """sim_sensors only (see module docstring and __init__). A
+        free-running timer, not tied to any particular phase's tick()
+        calls, so INS/altimeter stay fresh no matter which blocking wait
+        loop (WAIT_FCU, WAIT_GATE, ...) happens to be spinning right now --
+        anything hooked only into tick() would go stale during those.
+
+        Integrates whatever this node last actually commanded (_last_cmd,
+        set in publish()) into fake position/altitude. Heading is left
+        alone -- no yaw dynamics are modeled, since nothing this is meant
+        to exercise (phase sequencing, SEEK_ALTITUDE convergence/abort,
+        forward progress toward a faked gate) needs the vehicle to
+        actually steer.
+        """
+        now = time.time()
+        dt = now - self._sim_last_t
+        self._sim_last_t = now
+        if dt <= 0.0:
+            return
+
+        x, _r, z = self._last_cmd   # yaw (_r) intentionally unused -- no yaw dynamics modeled
+
+        speed = (x / 1000.0) * SIM_MAX_SPEED_MPS
+        self.vel_x = speed
+        h = math.radians(self.heading)
+        px, py = self.pos
+        self.pos = (px + speed * math.cos(h) * dt, py + speed * math.sin(h) * dt)
+
+        # Made-up ground truth, NOT a claim about the real vehicle -- see
+        # SIM_ALT_TRUTH_SIGN. Gives SEEK_ALTITUDE something to converge on
+        # when altitude_sign matches it, and diverge on (triggering the
+        # ALTITUDE_DIVERGE_M abort) when it doesn't.
+        rate = SIM_ALT_TRUTH_SIGN * (z - Z_NEUTRAL) / ALTITUDE_Z_MAX * SIM_MAX_CLIMB_MPS
+        self.altimeter_distance = clamp(self.altimeter_distance + rate * dt,
+                                        0.0, self.pool_depth_m)
+        self.altimeter_stamp = now
+
+        self.fom_ins = 1.0
+        self.ins_stamp = now
 
     def _on_detections(self, msg):
         try:
@@ -446,6 +620,7 @@ class Qualify(Node):
         m.r = float(clamp(r, -1000, 1000))
         m.buttons = 0
         self._log_cmd(m.x, m.y, m.z, m.r)   # log even in dry_run: what WOULD move
+        self._last_cmd = (m.x, m.r, m.z)   # sim_sensors' _sim_tick integrates this
         if not self.dry_run:
             self.ctrl.publish(m)
 
@@ -694,16 +869,25 @@ class Qualify(Node):
 
     def seek_altitude(self):
         """The one phase in this file that touches z. Drives toward
-        TARGET_ALTITUDE_M above the pool floor using /nucleus_node/
+        self.target_altitude_m above the pool floor using /nucleus_node/
         altimeter_packets, then hands neutral z straight back to ALT_HOLD --
         every other phase holds z at Z_NEUTRAL by design.
 
-        ALTITUDE_SIGN is UNVERIFIED (see module docstring): watch the
+        self.altitude_sign is UNVERIFIED (see module docstring): watch the
         altimeter log line for the first few seconds with the vehicle well
         clear of the floor. If altimeter_distance moves the WRONG way
-        (shrinking when it should grow, or vice versa), flip ALTITUDE_SIGN.
-        ALTITUDE_MIN_SAFE_M aborts immediately regardless of that -- if the
-        floor gets too close for any reason, stop before asking questions.
+        (shrinking when it should grow, or vice versa), pass
+        -p altitude_sign:=-1.0 and rerun. Two backstops guard the floor
+        regardless of whether that's been verified yet:
+
+          - self.altitude_min_safe_m aborts immediately on the raw reading,
+            checked every tick, independent of altitude_sign or the gains --
+            the one check that still works even if the sign is backwards.
+          - the diverge check below aborts if the altitude error is
+            demonstrably getting WORSE (not better) over one
+            ALTITUDE_STALL_CHECK_S window while z is meaningfully off
+            neutral -- the signature of a backwards sign -- rather than
+            grinding on it for the full ALTITUDE_TIMEOUT.
 
         x (forward thrust) is pinned to 0.0 for the entire phase -- it never
         drives. r (yaw) DOES stay active, holding gate_heading throughout,
@@ -712,8 +896,8 @@ class Qualify(Node):
 
         A stale altimeter reading does NOT abort the run: it holds neutral
         z (never drives on a number that might be old) and waits for a
-        fresh one. Only ALTITUDE_TIMEOUT overall, or the safety floor, can
-        end this phase early.
+        fresh one. Only ALTITUDE_TIMEOUT overall, or one of the two
+        backstops above, can end this phase early.
 
         Whether ALTITUDE_Z_MAX/ALTITUDE_KP actually produce enough thrust to
         move the vehicle is its own unverified thing -- this tracks the
@@ -723,15 +907,16 @@ class Qualify(Node):
         clear warning instead of silently grinding away with no effect.
         """
         self.enter("SEEK_ALTITUDE")
+        self._log("info", "going down to depth")
         if not self.spin_until(lambda: self.altimeter_distance is not None,
                                10.0, "altimeter"):
             raise Abort("no altimeter data -- cannot seek altitude")
 
         end = time.time() + ALTITUDE_TIMEOUT
-        stall_ref_alt, stall_ref_time = None, None
+        stall_ref_alt, stall_ref_error, stall_ref_time = None, None, None
         while True:
             if time.time() > end:
-                raise Abort(f"could not reach {TARGET_ALTITUDE_M:.2f}m altitude in "
+                raise Abort(f"could not reach {self.target_altitude_m:.2f}m altitude in "
                             f"{ALTITUDE_TIMEOUT:.0f}s")
 
             alt = self.altimeter_distance
@@ -743,13 +928,13 @@ class Qualify(Node):
                 self.tick(0.0, self.yaw_to(self.gate_heading), z=Z_NEUTRAL)   # never act on a possibly-stale number
                 continue
 
-            if alt < ALTITUDE_MIN_SAFE_M:
-                raise Abort(f"altimeter {alt:.2f}m < {ALTITUDE_MIN_SAFE_M}m safety floor")
+            if alt < self.altitude_min_safe_m:
+                raise Abort(f"altimeter {alt:.2f}m < {self.altitude_min_safe_m}m safety floor")
 
-            error = TARGET_ALTITUDE_M - alt   # +ve: too close to the floor, need more room
+            error = self.target_altitude_m - alt   # +ve: too close to the floor, need more room
             if abs(error) <= ALTITUDE_TOLERANCE_M:
                 self._log("info",
-                    f"altitude {alt:.2f}m, target {TARGET_ALTITUDE_M:.2f}m "
+                    f"altitude {alt:.2f}m, target {self.target_altitude_m:.2f}m "
                     f"(within {ALTITUDE_TOLERANCE_M:.2f}m). Switching back to ALT_HOLD.")
                 self.publish(0.0, self.yaw_to(self.gate_heading), z=Z_NEUTRAL)
                 if not self.set_mode("ALT_HOLD"):
@@ -759,30 +944,38 @@ class Qualify(Node):
                     raise Abort("could not switch back to ALT_HOLD after SEEK_ALTITUDE")
                 return
 
-            z = clamp(Z_NEUTRAL + ALTITUDE_SIGN * ALTITUDE_KP * error,
+            z = clamp(Z_NEUTRAL + self.altitude_sign * ALTITUDE_KP * error,
                      Z_NEUTRAL - ALTITUDE_Z_MAX, Z_NEUTRAL + ALTITUDE_Z_MAX)
 
             now = time.time()
             if stall_ref_alt is None:
-                stall_ref_alt, stall_ref_time = alt, now
+                stall_ref_alt, stall_ref_error, stall_ref_time = alt, error, now
             moved = abs(alt - stall_ref_alt)
             elapsed = now - stall_ref_time
             rate = f"{(alt - stall_ref_alt) / elapsed * 1000:+.0f}mm/s" if elapsed > 0.5 else "measuring..."
             if elapsed > ALTITUDE_STALL_CHECK_S:
+                commanding = abs(z - Z_NEUTRAL) > (ALTITUDE_Z_MAX * 0.2)
+                diverged = abs(error) - abs(stall_ref_error)
+                if commanding and diverged > ALTITUDE_DIVERGE_M:
+                    raise Abort(
+                        f"altitude error GREW from {stall_ref_error:+.2f}m to {error:+.2f}m "
+                        f"over {elapsed:.0f}s while commanding z={z:.0f} -- altitude_sign is "
+                        f"almost certainly backwards. Rerun with -p altitude_sign:="
+                        f"{-self.altitude_sign:.1f}.")
                 if moved < ALTITUDE_STALL_MIN_MOVE_M:
                     self._log("warn",
                         f"commanding z={z:.0f} (delta {z - Z_NEUTRAL:+.0f}) for "
                         f"{elapsed:.0f}s but altitude only moved {moved * 1000:.0f}mm "
-                        f"-- not enough thrust? ALTITUDE_SIGN backwards? Consider "
+                        f"-- not enough thrust? altitude_sign backwards? Consider "
                         f"raising ALTITUDE_KP/ALTITUDE_Z_MAX.")
-                stall_ref_alt, stall_ref_time = alt, now   # start a fresh measurement window
+                stall_ref_alt, stall_ref_error, stall_ref_time = alt, error, now   # fresh window
 
             # Deliberately NOT labelled ascend/descend: which way z actually
             # moves the vehicle is exactly the unverified thing being
             # watched here. Read the trend of `altimeter` itself against
             # the sign of `z - neutral` to find out, don't trust a label.
             self.log_every("seek_altitude", 1.0, lambda: (
-                f"  altimeter {alt:.2f}m  target {TARGET_ALTITUDE_M:.2f}m  "
+                f"  altimeter {alt:.2f}m  target {self.target_altitude_m:.2f}m  "
                 f"error {error:+.2f}m  rate {rate}  age {age:.2f}s  "
                 f"z {z:.0f} (neutral {Z_NEUTRAL:.0f}, delta {z - Z_NEUTRAL:+.0f})"))
             self.tick(0.0, self.yaw_to(self.gate_heading), z=z)
@@ -817,6 +1010,7 @@ class Qualify(Node):
         forward and just hold heading until it reappears (or the mission
         clock / an abort ends things)."""
         self.enter("DRIVE_TO_GATE")
+        self._log("info", "moving forward")
         ever_seen = False
         lost_since = None
 
