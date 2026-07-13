@@ -31,6 +31,10 @@ kill_stack() {
   pkill -9 -f nucleus_node   2>/dev/null
   pkill -9 mavlink-routerd   2>/dev/null
   pkill -9 -f qualify.py     2>/dev/null
+  # The ros2 CLI daemon (spawned by our topic-list polling) otherwise lingers
+  # in the service cgroup and makes systemd wait the full stop-timeout, marking
+  # the run Failed even though the mission completed.
+  pkill -9 -f ros2cli        2>/dev/null
 }
 trap kill_stack EXIT
 
