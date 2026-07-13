@@ -46,30 +46,37 @@ echo "[autostart] clearing stale FastRTPS shared-memory segments"
 rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* /dev/shm/*fastdds* 2>/dev/null
 sleep 1
 
-echo "[autostart] bringing up stack (router + MAVROS, no Nucleus)"
-./nautilus_up.sh &
-STACK_PID=$!
-
-echo "[autostart] waiting for /mavros/state (up to 180s)"
-END=$(( $(date +%s) + 180 ))
-until ros2 topic list 2>/dev/null | grep -q "/mavros/state"; do
-  if [ "$(date +%s)" -gt "$END" ]; then
-    echo "[autostart] MAVROS not up within 180s -- aborting, NOT arming."
-    exit 1   # trap kill_stack runs
-  fi
-  sleep 2
+# Bring up the stack and wait for the Cube to actually CONNECT (connected:true),
+# RETRYING the whole bring-up if it doesn't. On a cold power-up the Cube
+# (ArduSub) is still booting and may not heartbeat within one attempt's window;
+# a fresh bring-up on the next attempt catches it. This is what makes cold-boot
+# deployment reliable instead of finicky.
+CONNECTED=false
+for attempt in 1 2 3 4 5; do
+  echo "[autostart] stack bring-up attempt $attempt (router + MAVROS, no Nucleus)"
+  ./nautilus_up.sh &
+  STACK_PID=$!
+  END=$(( $(date +%s) + 70 ))
+  while [ "$(date +%s)" -lt "$END" ]; do
+    if pgrep -f mavros_node >/dev/null \
+       && timeout 4 ros2 topic echo /mavros/state --once 2>/dev/null | grep -q "connected: true"; then
+      CONNECTED=true
+      break
+    fi
+    sleep 3
+  done
+  [ "$CONNECTED" = true ] && break
+  echo "[autostart] Cube not connected on attempt $attempt (still booting / link down?). Restarting stack."
+  kill_stack
+  sleep 4
 done
-echo "[autostart] MAVROS topic seen. Settling 10s."
-sleep 10
-
-# ros2 topic list reads the daemon's CACHED graph and can report a dead
-# publisher. Verify MAVROS is actually alive before arming.
-if ! pgrep -f mavros_node >/dev/null; then
-  echo "[autostart] MAVROS DIED after coming up. NOT arming."
-  echo "[autostart]   mavros pids: [$(pgrep -f mavros_node | tr '\n' ' ')]  router: [$(pgrep mavlink-routerd | tr '\n' ' ')]"
+if [ "$CONNECTED" != true ]; then
+  echo "[autostart] Cube never sent connected:true after $attempt attempts. NOT arming."
+  echo "[autostart]   -> check Cube power and the CP2102<->TELEM serial lead on the vehicle."
   exit 1
 fi
-echo "[autostart] MAVROS alive. Launching open-loop hard-code mission."
+echo "[autostart] Cube CONNECTED (connected:true). Settling 5s, then launching mission."
+sleep 5
 
 # ---- MISSION PARAMS (tune here) ----
 python3 scripts/qualify.py --ros-args \
