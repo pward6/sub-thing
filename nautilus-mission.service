@@ -40,7 +40,10 @@ User=nano
 KillMode=mixed
 Environment=NAUTILUS_AUTOSTART=1
 ExecStart=/home/nano/nautilus_ws/scripts/nautilus_session.sh
-ExecStop=/usr/bin/tmux kill-session -t nautilus
+# Leading '-' so a missing session (nothing to kill) is not treated as a
+# failure. NOTE: this is oneshot+RemainAfterExit, so to RE-RUN it you must
+# use `systemctl restart` -- `systemctl start` is a no-op once it's active.
+ExecStop=-/usr/bin/tmux kill-session -t nautilus
 
 [Install]
 WantedBy=multi-user.target
