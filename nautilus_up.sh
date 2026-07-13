@@ -198,6 +198,12 @@ else
 fi
 
 # ================= 3. NUCLEUS =================
+# SKIP_NUCLEUS=1 brings up router + MAVROS only (no DVL/INS). For the
+# open-loop hard-code run, which needs only the Cube -- use it when the
+# Nucleus won't connect and you don't need heading/position.
+if [ "${SKIP_NUCLEUS:-0}" = "1" ]; then
+  warn "SKIP_NUCLEUS=1: bringing up router + MAVROS ONLY, no Nucleus/DVL/INS."
+else
 sub nucleus "Starting nucleus_node (log: $NODE_LOG)..."
 ros2 run nucleus_driver_ros2 nucleus_node >"$NODE_LOG" 2>&1 &
 
@@ -225,6 +231,7 @@ sub nucleus "Connected."
 out=$(ros2 service call /nucleus_node/start interfaces/srv/Start "{}" 2>&1)
 echo "$out" | grep -q "reply='OK" || { err "Nucleus start failed:"; echo "$out"; exit 1; }
 sub nucleus "STREAMING."
+fi
 
 # ================= SUMMARY =================
 echo

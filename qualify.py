@@ -275,6 +275,9 @@ class Qualify(Node):
         d("sim_thrust", False)              # DANGER: with sim_sensors, actually ARM and PUBLISH
                                              # thrust instead of forcing dry_run -- real thrusters
                                              # WILL SPIN off fake sensors. Bench HIL check only.
+        d("no_nucleus", False)              # run with NO Nucleus/DVL/INS at all: skip the INS +
+                                             # altimeter subscriptions, no heading hold (drives
+                                             # straight on thrust alone). Open-loop hard-code only.
         d("target_heading", float("nan"))   # NaN -> capture at arm
         d("cruise_speed", 0.35)             # thrust fraction while driving
         d("arm_delay", 5.0)                 # s between gate acquired and arming
@@ -302,6 +305,7 @@ class Qualify(Node):
         self.fake_range = float(g("fake_gate_range_m"))
         self.sim_sensors = bool(g("sim_sensors"))
         self.sim_thrust = bool(g("sim_thrust"))
+        self.no_nucleus = bool(g("no_nucleus"))
         if self.sim_sensors and not self.dry_run and not self.sim_thrust:
             self.dry_run = True   # sim_sensors forces dry_run -- sim_thrust is the explicit opt-out
         if self.sim_thrust and not self.sim_sensors:
@@ -333,12 +337,15 @@ class Qualify(Node):
 
         # INS state. Under sim_sensors these are seeded live (not None/0)
         # since no real _on_ins will ever arrive to populate them, and kept
-        # fresh afterward by the _sim_tick timer set up below.
-        self.heading = 0.0 if self.sim_sensors else None
-        self.pos = (0.0, 0.0) if self.sim_sensors else None   # (x, y) in INS frame
+        # fresh afterward by the _sim_tick timer set up below. no_nucleus
+        # seeds them too (there is no INS at all) but they stay static --
+        # heading 0 means yaw_to() commands no yaw, i.e. no heading hold.
+        _seed_ins = self.sim_sensors or self.no_nucleus
+        self.heading = 0.0 if _seed_ins else None
+        self.pos = (0.0, 0.0) if _seed_ins else None   # (x, y) in INS frame
         self.vel_x = 0.0
-        self.fom_ins = 1.0 if self.sim_sensors else 999.0
-        self.ins_stamp = time.time() if self.sim_sensors else 0.0
+        self.fom_ins = 1.0 if _seed_ins else 999.0
+        self.ins_stamp = time.time() if _seed_ins else 0.0
 
         # Altimeter state (SEEK_ALTITUDE only). Seeded near the surface under
         # sim_sensors (pool depth minus a little headroom, not pool depth
@@ -378,7 +385,7 @@ class Qualify(Node):
                                      self._match_qos("/mavros/state"))
         self.ctrl = self.create_publisher(ManualControl,
                                           "/mavros/manual_control/send", 10)
-        if not self.sim_sensors:
+        if not self.sim_sensors and not self.no_nucleus:
             self._subscribe_ins(qos)
             self._subscribe_altimeter(qos)
         self.create_subscription(String, "/nautilus/detections",
@@ -425,6 +432,12 @@ class Qualify(Node):
                 "about altitude_sign or any other real-world direction or gain. "
                 "Only a real pool run with the vehicle clear of the floor verifies "
                 "that.")
+        if self.no_nucleus:
+            self._log("warn",
+                "NO_NUCLEUS: no DVL/INS/altimeter -- skipping those subscriptions. "
+                "NO heading hold (drives straight on thrust alone, may curve). Needs "
+                "MAVROS/Cube only. Open-loop hard-code mission only; aim the vehicle "
+                "before it arms.")
         if self.sim_thrust:
             self._log("warn",
                 "*** SIM_THRUST: sensors are FAKE but the vehicle WILL ARM and the "
@@ -709,6 +722,8 @@ class Qualify(Node):
         return along, cross
 
     def ins_ok(self):
+        if self.no_nucleus:
+            return True   # no INS by design; guard() must not abort on stale/absent INS
         if self.heading is None or self.pos is None:
             return False
         if (time.time() - self.ins_stamp) > INS_TIMEOUT:
