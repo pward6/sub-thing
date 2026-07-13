@@ -91,9 +91,10 @@ if [ "${NAUTILUS_AUTOSTART:-0}" = "1" ]; then
     "$SRC && sleep 20 && python3 $SCRIPTS/qualify.py --ros-args \
       -p hard_code_enable:=true \
       -p hard_code_open_loop:=true \
-      -p hard_code_descend_seconds:=4.0 \
+      -p hard_code_descend_seconds:=7.0 \
       -p hard_code_descend_thrust:=0.4 \
       -p hard_code_forward_seconds:=8.0 \
+      -p altitude_sign:=-1.0 \
       -p arm_delay:=30.0 \
       2>&1 | tee -a $BAGS/mission_\$(date +%F_%H%M%S).log" C-m
   echo "AUTOSTART: hard-code OPEN-LOOP mission. Arms after ~20s stack wait + 30s deploy countdown. KILL SWITCH is the interlock."

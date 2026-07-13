@@ -166,7 +166,7 @@ ALTITUDE_MIN_SAFE_M = 0.3  # m: abort immediately this close to the floor, no ma
                            # stopping. 0.3 is a placeholder: set this from your actual
                            # pool depth / vehicle draft with real margin, and keep it
                            # comfortably below target_altitude_m.
-ALTITUDE_SIGN = 1.0           # UNVERIFIED direction -- flip to -1.0 if it moves the wrong way
+ALTITUDE_SIGN = -1.0          # VERIFIED on this vehicle: +1.0 drove it UP, so down is -1.0
 ALTITUDE_STALL_CHECK_S = 8.0   # s: window to judge "is it actually moving" (and,
                                # now, moving the right way -- see seek_altitude)
 ALTITUDE_STALL_MIN_MOVE_M = 0.03   # m: less than this over the window counts as stalled
@@ -220,7 +220,7 @@ HARD_CODE_FORWARD_DISTANCE_FT = 10.0   # ft to drive forward on the captured hea
 # not distance: there is no trusted sensor to measure distance with, so you
 # tune the times by watching the pool. Direction of "down" obeys altitude_sign.
 HARD_CODE_OPEN_LOOP = False             # true -> timed open-loop descent+forward (ignore DVL)
-HARD_CODE_DESCEND_SECONDS = 4.0         # s to command down-thrust (keep short; ALT_HOLD then holds)
+HARD_CODE_DESCEND_SECONDS = 7.0         # s to command down-thrust (keep short; ALT_HOLD then holds)
 HARD_CODE_DESCEND_THRUST = 0.4          # fraction of full z authority (0-1); 0.4 -> 200 off neutral
 HARD_CODE_FORWARD_SECONDS = 8.0         # s to command forward-thrust through the gate
 
