@@ -24,6 +24,14 @@ pkill -9 mavlink-routerd  2>/dev/null
 pkill -9 -f qualify.py    2>/dev/null
 sleep 2
 
+# FastRTPS (the default RMW) keeps shared-memory segments in /dev/shm. Stale
+# ones left by repeated restarts break SERVICE discovery (topics still work),
+# which shows up as "arm: service unavailable" even though the stack is up.
+# Safe to remove here -- all ROS processes were just killed above.
+echo "[autostart] clearing stale FastRTPS shared-memory segments"
+rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* /dev/shm/*fastdds* 2>/dev/null
+sleep 1
+
 echo "[autostart] bringing up stack (nautilus_up.sh)"
 ./nautilus_up.sh &
 STACK_PID=$!
