@@ -84,6 +84,12 @@ vehicle.
         # below GATE_PASS_RANGE (1.6) or the simulated gate never closes
         # enough to finish drive_to_gate() -- expect ~15-20s to reach it,
         # that's FAKE_GATE_SECONDS playing out, not a hang.
+    ros2 run nautilus_auto qualify --ros-args -p hard_code_enable:=true -p sim_sensors:=true -p sim_thrust:=true
+        # bench HARDWARE-IN-THE-LOOP: fake sensors drive the sequence but the
+        # vehicle ACTUALLY ARMS and the thrusters ACTUALLY SPIN, to confirm the
+        # control path (arm -> MANUAL_CONTROL -> thruster) works. MAVROS must be
+        # running. CLEAR/REMOVE THE PROPELLERS FIRST. sim_thrust is the only way
+        # sim_sensors ever drives real hardware, and it requires sim_sensors.
 
 Every console log line is mirrored to a plain text file (see _open_run_log)
 alongside the per-command CSV (see _open_cmd_log), both under CMD_LOG_DIR --
@@ -238,7 +244,11 @@ class Qualify(Node):
         d("fake_gate_bearing_deg", 0.0)     # bearing to report while faking
         d("fake_gate_range_m", 3.0)         # range simulated CLOSING to by the end of the window
         d("sim_sensors", False)             # bench: fabricate FCU/INS/altimeter too, no other
-                                             # nodes needed (see module docstring). Forces dry_run.
+                                             # nodes needed (see module docstring). Forces dry_run
+                                             # UNLESS sim_thrust is also set.
+        d("sim_thrust", False)              # DANGER: with sim_sensors, actually ARM and PUBLISH
+                                             # thrust instead of forcing dry_run -- real thrusters
+                                             # WILL SPIN off fake sensors. Bench HIL check only.
         d("target_heading", float("nan"))   # NaN -> capture at arm
         d("cruise_speed", 0.35)             # thrust fraction while driving
         d("arm_delay", 5.0)                 # s between gate acquired and arming
@@ -261,8 +271,16 @@ class Qualify(Node):
         self.fake_bearing = float(g("fake_gate_bearing_deg"))
         self.fake_range = float(g("fake_gate_range_m"))
         self.sim_sensors = bool(g("sim_sensors"))
-        if self.sim_sensors and not self.dry_run:
-            self.dry_run = True   # sim_sensors must never drive a real vehicle -- warning logged below
+        self.sim_thrust = bool(g("sim_thrust"))
+        if self.sim_sensors and not self.dry_run and not self.sim_thrust:
+            self.dry_run = True   # sim_sensors forces dry_run -- sim_thrust is the explicit opt-out
+        if self.sim_thrust and not self.sim_sensors:
+            # sim_thrust only means anything as the "don't force dry_run" opt-out
+            # for sim_sensors. On its own it's almost certainly a mistake -- refuse
+            # rather than silently arm a real vehicle off REAL sensors in a bench test.
+            self.get_logger().fatal(
+                "sim_thrust:=true requires sim_sensors:=true. Refusing to run.")
+            raise SystemExit(1)
         self.gate_heading = float(g("target_heading"))
         self.cruise_v = float(g("cruise_speed")) * 1000.0
         self.arm_delay = float(g("arm_delay"))
@@ -361,11 +379,18 @@ class Qualify(Node):
             self._log("warn",
                 "SIM_SENSORS: FCU/INS/altimeter are all synthetic, integrated from "
                 "this node's own commands against a made-up ground truth -- no "
-                "MAVROS/nucleus_node/pipe_detector needed. This exercises the STATE "
+                "nucleus_node/pipe_detector needed. This exercises the STATE "
                 "MACHINE and the abort/safety LOGIC end to end; it proves NOTHING "
                 "about altitude_sign or any other real-world direction or gain. "
                 "Only a real pool run with the vehicle clear of the floor verifies "
                 "that.")
+        if self.sim_thrust:
+            self._log("warn",
+                "*** SIM_THRUST: sensors are FAKE but the vehicle WILL ARM and the "
+                "thrusters WILL SPIN off those fake sensors. This is a bench "
+                "hardware-in-the-loop check ONLY. MAVROS must be running for arming "
+                "and thrust to reach the FCU. CLEAR THE PROPELLERS / SECURE THE "
+                "VEHICLE / hand on the kill switch BEFORE the countdown ends. ***")
         if self.fake_gate:
             self._log("warn",
                 f"FAKE_GATE: gate faked CONFIRMED at bearing {self.fake_bearing:+.1f} deg, "
