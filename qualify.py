@@ -1,252 +1,158 @@
-"""
-Look for the gate -> descend for a specified time -> drive forward for
-5 seconds -> stop -> disarm
 
-The vehicle switches to STABILIZE immediately after arming. SEEK_ALTITUDE
-retains its existing function name for compatibility, but it no longer
-reads the DVL or altimeter and does not calculate depth or altitude.
+   Look for the gate -> drive to it -> stop -> disarm
 
-While in STABILIZE, SEEK_ALTITUDE commands a constant vertical thrust for
-ALTITUDE_TIMEOUT seconds. After the timed descent is complete, the vehicle
-returns its vertical command to neutral and drives forward for
-FORWARD_DRIVE_TIME seconds.
+ALMOST NO DEPTH LOGIC. Mode is ALT_HOLD: ArduSub regulates depth on its own
+barometer and holds whatever depth the vehicle is at. The ONE deliberate
+exception is SEEK_ALTITUDE, right after arming: it reads
+/nucleus_node/altimeter_packets and drives z until the vehicle is
+TARGET_ALTITUDE_M above the pool floor, then hands neutral z straight back
+to ALT_HOLD. Every other phase never touches z.
+ALMOST NO DEPTH LOGIC. Mode is ALT_HOLD everywhere except the ONE
+deliberate exception, SEEK_ALTITUDE, right after arming: ALT_HOLD's z
+channel is a capped climb/descent RATE around a hold point (the mode's job
+is to resist depth change), too gentle for actively driving to a target
+depth. So SEEK_ALTITUDE switches to STABILIZE (direct z response, still
+levels roll/pitch), reads /nucleus_node/altimeter_packets and drives z
+until the vehicle is TARGET_ALTITUDE_M above the pool floor, then switches
+back to ALT_HOLD before anything else runs. Every other phase never
+touches z, and ALT_HOLD does the actual holding for the rest of the run.
 
-After the forward movement is complete, all movement commands are returned
-to neutral and the vehicle is disarmed.
-
-ALTITUDE_SIGN controls the direction of the vertical command. With the
-current convention, ALTITUDE_SIGN = 1.0 commands a z value below
-Z_NEUTRAL. If the vehicle rises instead of descending, change
-ALTITUDE_SIGN to -1.0.
-"""
-
-
-# SEEK_ALTITUDE
-#
-# Existing variable names are retained so other parts of the program do not
-# break. SEEK_ALTITUDE is now a timed descent and does not use DVL or
-# altimeter measurements.
-TARGET_ALTITUDE_M = 0.0           # retained for compatibility; no longer used
-ALTITUDE_TOLERANCE_M = 0.1        # retained for compatibility; no longer used
-ALTITUDE_KP = 300.0               # retained for compatibility; no longer used
-
-ALTITUDE_Z_MAX = 200.0            # fixed z offset from neutral during descent
-ALTITUDE_TIMEOUT = 5.0            # seconds to descend
-
-ALTIMETER_TIMEOUT = 3.0           # retained for compatibility; no longer used here
-ALTITUDE_MIN_SAFE_M = 0.0         # retained for compatibility; no longer used here
-ALTITUDE_SIGN = 1.0               # change to -1.0 if the vehicle rises
-ALTITUDE_STALL_CHECK_S = 8.0      # retained for compatibility; no longer used
-ALTITUDE_STALL_MIN_MOVE_M = 0.03  # retained for compatibility; no longer used
-
-# Forward-drive settings
-FORWARD_DRIVE_TIME = 5.0          # seconds to drive forward after descending
-FORWARD_DRIVE_X = 200.0           # forward command; increase or decrease as needed
-
+SEEK_ALTITUDE's z-direction (ALTITUDE_SIGN) is UNVERIFIED -- whether raising
+z moves the vehicle up or down is an ArduSub/wiring convention this code
+@@ -71,15 +74,19 @@
+# SEEK_ALTITUDE (the one exception to "no depth logic" -- see module docstring)
+TARGET_ALTITUDE_M = 0.0      # m above the pool floor to reach before SETTLE
+ALTITUDE_TOLERANCE_M = 0.1    # m: within this band of target counts as "there"
+ALTITUDE_KP = 150.0           # z units per metre of error -- gentle; verify in pool
+ALTITUDE_Z_MAX = 80.0         # z units off neutral, hard cap (of the 0-1000 range)
+ALTITUDE_KP = 300.0           # z units per metre of error -- verify in pool
+ALTITUDE_Z_MAX = 200.0        # z units off neutral, hard cap (of the 0-1000 range) --
+                              # raised from 80: that wasn't moving the vehicle fast
+                              # enough. Still short of full-scale (500) on purpose.
+ALTITUDE_TIMEOUT = 120.0      # s to reach target before aborting
+ALTIMETER_TIMEOUT = 3.0       # s: altimeter reports in pulses, not continuously --
+# this must be looser than INS_TIMEOUT or every gap
+# between pulses reads as "stale" and the z command
+# pulses on/off in lockstep with the sensor.
+ALTITUDE_MIN_SAFE_M = 0.0  # m: abort immediately this close to the floor, no matter what
+ALTITUDE_SIGN = 1.0           # UNVERIFIED direction -- flip to -1.0 if it moves the wrong way
+ALTITUDE_STALL_CHECK_S = 8.0   # s: window to judge "is it actually moving"
+ALTITUDE_STALL_MIN_MOVE_M = 0.03   # m: less than this over the window counts as stalled
 
 # Fixed tuning constants. These get set once from pool testing and rarely
 # change between runs -- edit them here rather than adding another ROS
-# parameter.
+@@ -117,7 +124,8 @@ def __init__(self):
 
+d = self.declare_parameter
+d("dry_run", False)
+        d("fake_gate", False)               # bench: fake a solid gate, no camera needed
+        d("fake_gate", True)                # bench: fake a solid gate, no camera needed --
+                                             # default ON; pass fake_gate:=false for a real run
+d("fake_gate_bearing_deg", 0.0)     # bearing to report while faking
+d("fake_gate_range_m", 3.0)         # range simulated CLOSING to by the end of the window
+d("target_heading", float("nan"))   # NaN -> capture at arm
+@@ -579,7 +587,14 @@ def run(self):
+if not self.arm(True):
+self._log("fatal", "arm rejected (SYSID_MYGCS=1?)")
+return 1
+        if not self.set_mode("ALT_HOLD"):
+        # STABILIZE for SEEK_ALTITUDE: ALT_HOLD's z channel is a capped
+        # climb/descent RATE around a hold point (the mode's whole job is
+        # to resist depth change) -- too gentle for actively driving to a
+        # target depth. STABILIZE gives z a much more direct thruster
+        # response while still levelling roll/pitch. seek_altitude()
+        # switches back to ALT_HOLD itself once it reaches target, before
+        # anything else runs.
+        if not self.set_mode("STABILIZE"):
+self._log("fatal", "mode rejected")
+self.arm(False)
+return 1
+@@ -690,20 +705,30 @@ def seek_altitude(self):
+       ALTITUDE_MIN_SAFE_M aborts immediately regardless of that -- if the
+       floor gets too close for any reason, stop before asking questions.
 
-def __init__(self):
-    d = self.declare_parameter
+        x and r are pinned to 0.0 for the entire phase -- no forward thrust,
+        no yaw correction, ever. This phase only ever commands z.
+        x (forward thrust) is pinned to 0.0 for the entire phase -- it never
+        drives. r (yaw) DOES stay active, holding gate_heading throughout,
+        so a disturbance can't spin the vehicle off heading during the up
+        to ALTITUDE_TIMEOUT seconds this phase may take.
 
-    d("dry_run", False)
+       A stale altimeter reading does NOT abort the run: it holds neutral
+       z (never drives on a number that might be old) and waits for a
+       fresh one. Only ALTITUDE_TIMEOUT overall, or the safety floor, can
+       end this phase early.
 
-    d(
-        "fake_gate",
-        True
-    )  # bench default; pass fake_gate:=false for a real run
+        Whether ALTITUDE_Z_MAX/ALTITUDE_KP actually produce enough thrust to
+        move the vehicle is its own unverified thing -- this tracks the
+        altimeter's real rate of change against a reference point every
+        ALTITUDE_STALL_CHECK_S seconds, and if it hasn't moved at least
+        ALTITUDE_STALL_MIN_MOVE_M despite commanding non-neutral z, logs a
+        clear warning instead of silently grinding away with no effect.
+       """
+self.enter("SEEK_ALTITUDE")
+if not self.spin_until(lambda: self.altimeter_distance is not None,
+10.0, "altimeter"):
+raise Abort("no altimeter data -- cannot seek altitude")
 
-    d("fake_gate_bearing_deg", 0.0)
-    d("fake_gate_range_m", 3.0)
-    d("target_heading", float("nan"))
+end = time.time() + ALTITUDE_TIMEOUT
+        stall_ref_alt, stall_ref_time = None, None
+while True:
+if time.time() > end:
+raise Abort(f"could not reach {TARGET_ALTITUDE_M:.2f}m altitude in "
+@@ -715,7 +740,7 @@ def seek_altitude(self):
+self.log_every("seek_altitude_stale", 1.0, lambda: (
+f"  altimeter stale ({age:.2f}s old, last reading {alt:.2f}m) "
+f"-- holding, waiting for a fresh one"))
+                self.tick(0.0, 0.0, z=Z_NEUTRAL)   # never act on a possibly-stale number
+                self.tick(0.0, self.yaw_to(self.gate_heading), z=Z_NEUTRAL)   # never act on a possibly-stale number
+continue
 
-    # Keep the remainder of the existing __init__ function unchanged.
+if alt < ALTITUDE_MIN_SAFE_M:
+@@ -725,21 +750,42 @@ def seek_altitude(self):
+if abs(error) <= ALTITUDE_TOLERANCE_M:
+self._log("info",
+f"altitude {alt:.2f}m, target {TARGET_ALTITUDE_M:.2f}m "
+                    f"(within {ALTITUDE_TOLERANCE_M:.2f}m). Holding here.")
+                self.publish(0.0, 0.0, z=Z_NEUTRAL)
+                    f"(within {ALTITUDE_TOLERANCE_M:.2f}m). Switching back to ALT_HOLD.")
+                self.publish(0.0, self.yaw_to(self.gate_heading), z=Z_NEUTRAL)
+                if not self.set_mode("ALT_HOLD"):
+                    # STABILIZE does not hold depth -- continuing the rest of
+                    # the run believing z=neutral means "depth held" would be
+                    # false. Treat this as seriously as any other mode failure.
+                    raise Abort("could not switch back to ALT_HOLD after SEEK_ALTITUDE")
+return
 
+z = clamp(Z_NEUTRAL + ALTITUDE_SIGN * ALTITUDE_KP * error,
+Z_NEUTRAL - ALTITUDE_Z_MAX, Z_NEUTRAL + ALTITUDE_Z_MAX)
 
-def run(self):
-    # Keep all existing code above this section unchanged.
+            now = time.time()
+            if stall_ref_alt is None:
+                stall_ref_alt, stall_ref_time = alt, now
+            moved = abs(alt - stall_ref_alt)
+            elapsed = now - stall_ref_time
+            rate = f"{(alt - stall_ref_alt) / elapsed * 1000:+.0f}mm/s" if elapsed > 0.5 else "measuring..."
+            if elapsed > ALTITUDE_STALL_CHECK_S:
+                if moved < ALTITUDE_STALL_MIN_MOVE_M:
+                    self._log("warn",
+                        f"commanding z={z:.0f} (delta {z - Z_NEUTRAL:+.0f}) for "
+                        f"{elapsed:.0f}s but altitude only moved {moved * 1000:.0f}mm "
+                        f"-- not enough thrust? ALTITUDE_SIGN backwards? Consider "
+                        f"raising ALTITUDE_KP/ALTITUDE_Z_MAX.")
+                stall_ref_alt, stall_ref_time = alt, now   # start a fresh measurement window
 
-    if not self.arm(True):
-        self._log("fatal", "arm rejected (SYSID_MYGCS=1?)")
-        return 1
-
-    # STABILIZE provides direct vertical and forward control while still
-    # stabilizing roll and pitch.
-    if not self.set_mode("STABILIZE"):
-        self._log("fatal", "mode rejected")
-        self.arm(False)
-        return 1
-
-    try:
-        # Timed descent followed by timed forward movement.
-        self.seek_altitude()
-
-    except Abort as exc:
-        self._log("fatal", str(exc))
-
-        # Stop all movement before disarming after an abort.
-        self.publish(
-            0.0,
-            0.0,
-            z=Z_NEUTRAL
-        )
-
-        self.arm(False)
-        return 1
-
-    # Stop all movement before disarming.
-    self.publish(
-        0.0,
-        0.0,
-        z=Z_NEUTRAL
-    )
-
-    self._log("info", "mission complete. Disarming.")
-
-    if not self.arm(False):
-        self._log("fatal", "disarm rejected")
-        return 1
-
-    return 0
-
-
-def seek_altitude(self):
-    """
-    Descend for a fixed amount of time without using DVL or altimeter data,
-    then drive forward for an additional fixed amount of time.
-
-    The existing function name is retained so existing calls to
-    seek_altitude() do not need to change.
-
-    During the descent:
-
-    - The vehicle remains in STABILIZE.
-    - Forward thrust stays at zero.
-    - Yaw continues holding gate_heading.
-    - DVL and altimeter readings are ignored.
-    - A fixed vertical command is applied for ALTITUDE_TIMEOUT seconds.
-
-    After the descent:
-
-    - Vertical thrust returns to neutral.
-    - The vehicle remains in STABILIZE.
-    - The vehicle drives forward for FORWARD_DRIVE_TIME seconds.
-    - Yaw continues holding gate_heading.
-    - The vehicle stops and returns control to run(), which disarms it.
-    """
-    self.enter("SEEK_ALTITUDE")
-
-    # -------------------------------------------------------------
-    # Timed descent
-    # -------------------------------------------------------------
-
-    descent_end = time.time() + ALTITUDE_TIMEOUT
-
-    # With the default values:
-    #
-    # Z_NEUTRAL = 500
-    # ALTITUDE_SIGN = 1.0
-    # ALTITUDE_Z_MAX = 200
-    #
-    # z = 500 - (1.0 * 200) = 300
-    descent_z = clamp(
-        Z_NEUTRAL - ALTITUDE_SIGN * ALTITUDE_Z_MAX,
-        0.0,
-        1000.0
-    )
-
-    while True:
-        now = time.time()
-
-        if now >= descent_end:
-            break
-
-        remaining = max(0.0, descent_end - now)
-
-        self.log_every(
-            "seek_altitude",
-            1.0,
-            lambda: (
-                f"  timed descent  "
-                f"{remaining:.1f}s remaining  "
-                f"z {descent_z:.0f} "
-                f"(neutral {Z_NEUTRAL:.0f}, "
-                f"delta {descent_z - Z_NEUTRAL:+.0f})"
-            )
-        )
-
-        # No forward movement during descent.
-        # Continue holding the gate heading.
-        # Ignore all DVL and altimeter readings.
-        self.tick(
-            0.0,
-            self.yaw_to(self.gate_heading),
-            z=descent_z
-        )
-
-    # Return vertical thrust to neutral before driving forward.
-    self.publish(
-        0.0,
-        self.yaw_to(self.gate_heading),
-        z=Z_NEUTRAL
-    )
-
-    self._log(
-        "info",
-        f"timed descent complete after {ALTITUDE_TIMEOUT:.1f}s. "
-        f"Driving forward for {FORWARD_DRIVE_TIME:.1f}s."
-    )
-
-    # -------------------------------------------------------------
-    # Timed forward movement
-    # -------------------------------------------------------------
-
-    forward_end = time.time() + FORWARD_DRIVE_TIME
-
-    while True:
-        now = time.time()
-
-        if now >= forward_end:
-            break
-
-        remaining = max(0.0, forward_end - now)
-
-        self.log_every(
-            "timed_forward_drive",
-            1.0,
-            lambda: (
-                f"  timed forward drive  "
-                f"{remaining:.1f}s remaining  "
-                f"x {FORWARD_DRIVE_X:.0f}"
-            )
-        )
-
-        # Drive forward while keeping vertical thrust neutral and
-        # continuing to hold the gate heading.
-        self.tick(
-            FORWARD_DRIVE_X,
-            self.yaw_to(self.gate_heading),
-            z=Z_NEUTRAL
-        )
-
-    # Stop forward, yaw, and vertical movement.
-    self.publish(
-        0.0,
-        0.0,
-        z=Z_NEUTRAL
-    )
-
-    self._log(
-        "info",
-        f"forward drive complete after {FORWARD_DRIVE_TIME:.1f}s. "
-        "Stopping before disarm."
-    )
-
+# Deliberately NOT labelled ascend/descend: which way z actually
+# moves the vehicle is exactly the unverified thing being
+# watched here. Read the trend of `altimeter` itself against
+# the sign of `z - neutral` to find out, don't trust a label.
+self.log_every("seek_altitude", 1.0, lambda: (
+f"  altimeter {alt:.2f}m  target {TARGET_ALTITUDE_M:.2f}m  "
+                f"error {error:+.2f}m  age {age:.2f}s  "
+                f"error {error:+.2f}m  rate {rate}  age {age:.2f}s  "
+f"z {z:.0f} (neutral {Z_NEUTRAL:.0f}, delta {z - Z_NEUTRAL:+.0f})"))
+            self.tick(0.0, 0.0, z=z)
+            self.tick(0.0, self.yaw_to(self.gate_heading), z=z)
 
 def settle(self):
-    """Hold heading, no forward thrust. There is no depth logic here:"""
-
-    # Keep the rest of the existing settle() function unchanged.
+"""Hold heading, no forward thrust. There is no depth logic here:
