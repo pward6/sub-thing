@@ -24,10 +24,13 @@ export SKIP_NUCLEUS=1
 # so killing only its PID orphans them and they keep holding the FCU serial +
 # UDP ports 14540/14555 -> next run fails "port still in use".
 kill_stack() {
-  pkill -9 -f mavros_node   2>/dev/null
-  pkill -9 -f nucleus_node  2>/dev/null
-  pkill -9 mavlink-routerd  2>/dev/null
-  pkill -9 -f qualify.py    2>/dev/null
+  # Kill nautilus_up.sh FIRST (uncatchable SIGKILL) so it can't run its own
+  # hanging cleanup trap; then its children.
+  pkill -9 -f nautilus_up.sh 2>/dev/null
+  pkill -9 -f mavros_node    2>/dev/null
+  pkill -9 -f nucleus_node   2>/dev/null
+  pkill -9 mavlink-routerd   2>/dev/null
+  pkill -9 -f qualify.py     2>/dev/null
 }
 trap kill_stack EXIT
 

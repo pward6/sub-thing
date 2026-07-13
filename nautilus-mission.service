@@ -29,6 +29,8 @@ User=nano
 ExecStart=/home/nano/nautilus_ws/scripts/nautilus_autostart.sh
 # stack bring-up + countdown can take a while; don't let systemd time it out
 TimeoutStartSec=0
+# if teardown ever hangs, SIGKILL after 20s instead of the 90s default
+TimeoutStopSec=20
 # finite mission -- run once per boot, don't respawn in a loop
 Restart=no
 

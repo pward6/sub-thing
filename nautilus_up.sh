@@ -88,8 +88,13 @@ CLEANED=false
 cleanup() {
   [ "$CLEANED" = true ] && return; CLEANED=true
   echo; info "Tearing down stack..."
-  ros2 service call /nucleus_node/stop interfaces/srv/Stop "{}" >/dev/null 2>&1 || true
-  sleep 0.5
+  # With SKIP_NUCLEUS there is no nucleus_node to answer this RPC and
+  # `ros2 service call` would HANG forever (systemd then stop-timeouts at 90s
+  # and marks the run Failed). Skip it; time-bound it even in the normal case.
+  if [ "${SKIP_NUCLEUS:-0}" != "1" ]; then
+    timeout 3 ros2 service call /nucleus_node/stop interfaces/srv/Stop "{}" >/dev/null 2>&1 || true
+    sleep 0.5
+  fi
   # pkill -f, not kill $PID: `ros2 run` wrapper dies but the node survives,
   # squatting on the UDP port and breaking the next run.
   pkill -9 -f nucleus_node   2>/dev/null || true
