@@ -34,8 +34,10 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 User=nano
-# tmux daemonizes its server; don't let systemd reap it when ExecStart exits.
-KillMode=none
+# RemainAfterExit keeps the tmux server alive after the launch script exits;
+# 'mixed' cleans the whole group up on stop (SIGTERM main, SIGKILL stragglers).
+# ExecStop below kills the tmux session first for a graceful stop.
+KillMode=mixed
 Environment=NAUTILUS_AUTOSTART=1
 ExecStart=/home/nano/nautilus_ws/scripts/nautilus_session.sh
 ExecStop=/usr/bin/tmux kill-session -t nautilus
