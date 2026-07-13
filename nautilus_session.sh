@@ -6,15 +6,15 @@
 #   window 1: vision    pipe_detector.py
 #   window 2: bag       ros2 bag record
 #   window 3: shell     empty, for you
-#   window 4: mission   qualify.py, ONLY if NAUTILUS_AUTOSTART=1
+#   window 4: mission   gate_pass.py, ONLY if NAUTILUS_AUTOSTART=1
 #
-# The mission node arms the vehicle by itself once it sees the gate on
-# six consecutive crossbar frames. Two things stand between a boot and a
-# spinning propeller:
+# gate_pass.py does NOT wait to see the gate and has NO arm countdown -- it
+# arms as soon as the FCU is connected and an INS heading is available, then
+# holds that heading and drives forward for a fixed duration. One thing
+# stands between a boot and a spinning propeller:
 #   - window 4 only exists when NAUTILUS_AUTOSTART=1 is in the environment
-#   - a 5 s countdown runs between gate acquisition and arming
 #
-# There is no water interlock and no depth logic. qualify.py sets ALT_HOLD
+# There is no water interlock and no depth logic. gate_pass.py sets ALT_HOLD
 # and never commands vertical thrust, so ArduSub holds whatever depth the
 # vehicle was launched at.
 #
@@ -65,11 +65,11 @@ tmux send-keys -t "$SESSION":bag \
 tmux new-window -t "$SESSION" -n shell
 tmux send-keys -t "$SESSION":shell "$SRC" C-m
 tmux send-keys -t "$SESSION":shell \
-  "echo 'Bench:  python3 $SCRIPTS/qualify.py --ros-args -p dry_run:=true -p gate_overshoot:=0.0'" C-m
+  "echo 'Bench:  python3 $SCRIPTS/gate_pass.py --ros-args -p dry_run:=true'" C-m
 tmux send-keys -t "$SESSION":shell \
-  "echo 'Live :  python3 $SCRIPTS/qualify.py --ros-args -p cruise_speed:=0.30'" C-m
+  "echo 'Live :  python3 $SCRIPTS/gate_pass.py --ros-args -p forward_thrust:=0.30'" C-m
 tmux send-keys -t "$SESSION":shell \
-  "echo 'Abort:  ros2 topic pub --once /nautilus/cmd/abort std_msgs/msg/Empty {}'" C-m
+  "echo 'Abort:  gate_pass.py has no /nautilus/cmd/abort listener -- Ctrl+C its window, or the kill switch'" C-m
 
 # ---- window 4: autonomous mission ----
 # Only when explicitly asked. The systemd unit sets NAUTILUS_AUTOSTART=1;
@@ -77,11 +77,10 @@ tmux send-keys -t "$SESSION":shell \
 if [ "${NAUTILUS_AUTOSTART:-0}" = "1" ]; then
   tmux new-window -t "$SESSION" -n mission
   tmux send-keys -t "$SESSION":mission \
-    "$SRC && sleep 45 && python3 $SCRIPTS/qualify.py --ros-args \
-      -p cruise_speed:=0.30 \
-      -p mission_timeout:=1000.0 \
+    "$SRC && sleep 20 && python3 $SCRIPTS/gate_pass.py --ros-args \
+      -p forward_thrust:=0.30 \
       2>&1 | tee -a $BAGS/mission_\$(date +%F_%H%M%S).log" C-m
-  echo "AUTOSTART: mission node will arm once it sees the gate."
+  echo "AUTOSTART: mission node will arm as soon as FCU + INS heading are ready -- no gate sighting, no countdown."
 fi
 
 echo "started. attach with:  tmux attach -t $SESSION"

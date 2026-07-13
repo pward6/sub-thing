@@ -45,6 +45,22 @@ it's corroborated by everything before it).
 The INS owns heading and supplies the sanity bounds that abort the run if we
 drive somewhere absurd.
 
+hard_code_enable:=true is the dead-reckoned qualify path -- NO vision, no
+gate, no camera. It descends hard_code_down_distance feet below the launch
+altitude, then drives hard_code_forward_distance feet forward on the heading
+captured at arm, then disarms. It reuses the exact same altimeter descent
+loop as SEEK_ALTITUDE (same safety floor, same backwards-sign backstops,
+same STABILIZE->ALT_HOLD handoff) and the same INS dead-reckoning
+(along_cross) the vision path uses for GATE_OVERSHOOT -- it just aims at
+fixed distances instead of at what the camera sees. This is the minimum
+needed to qualify (get down, get through) and is what to run when vision
+isn't ready. The three toggles are module constants below AND ROS
+parameters of the same name, so one CLI command sets them (see
+hard_code_run.sh for a one-command wrapper). "Down" is measured as the
+altimeter reading shrinking, so on a flat floor it equals a depth increase;
+it still depends on the altimeter, so the same altitude_sign / safety-floor
+cautions apply.
+
 sim_sensors:=true fabricates FCU/INS/altimeter data too, so the whole state
 machine (WAIT_FCU -> ... -> SEEK_ALTITUDE -> SETTLE -> DRIVE_TO_GATE ->
 DISARM) can be run above water with nothing else launched -- no MAVROS, no
@@ -162,6 +178,20 @@ SIM_ALT_TRUTH_SIGN = 1.0    # the simulator's OWN made-up ground truth for which
                             # abort) against. Tells you NOTHING about which way the
                             # real vehicle's z channel moves.
 
+# HARD-CODE MODE (dead-reckoned qualify: down then forward, no vision -- see
+# module docstring). These three toggles ARE the whole test. They are module
+# constants (edit here) AND ROS parameters of the same name (see __init__), so
+# one CLI command sets them without editing the file, e.g.:
+#   python3 qualify.py --ros-args -p hard_code_enable:=true \
+#       -p hard_code_down_distance:=3 -p hard_code_forward_distance:=10
+# or just run hard_code_run.sh, which wraps exactly that.
+HARD_CODE_ENABLE = False               # master switch. true -> skip vision entirely:
+                                       # descend a fixed distance, drive forward a fixed
+                                       # distance, disarm. Default false so a normal
+                                       # (vision) run is unaffected unless asked for.
+HARD_CODE_DOWN_DISTANCE_FT = 3.0       # ft to descend BELOW the launch altitude
+HARD_CODE_FORWARD_DISTANCE_FT = 10.0   # ft to drive forward on the captured heading
+
 # Fixed tuning constants. These get set once from pool testing and rarely
 # change between runs -- edit them here rather than adding another ROS
 # parameter nobody remembers to set. Only the things you'd actually want to
@@ -221,6 +251,9 @@ class Qualify(Node):
         d("altitude_sign", ALTITUDE_SIGN)             # UNVERIFIED direction -- see module docstring
         d("altitude_min_safe_m", ALTITUDE_MIN_SAFE_M)  # hard abort floor -- size to the real pool
         d("pool_depth_ft", POOL_DEPTH_FT)             # ft: sanity ceiling for altimeter readings
+        d("hard_code_enable", HARD_CODE_ENABLE)               # dead-reckoned down-then-forward, no vision
+        d("hard_code_down_distance", HARD_CODE_DOWN_DISTANCE_FT)      # ft to descend below launch altitude
+        d("hard_code_forward_distance", HARD_CODE_FORWARD_DISTANCE_FT)  # ft to drive forward on captured heading
 
         g = lambda n: self.get_parameter(n).value
         self.dry_run = bool(g("dry_run"))
@@ -241,6 +274,9 @@ class Qualify(Node):
         self.altitude_sign = float(g("altitude_sign"))
         self.altitude_min_safe_m = float(g("altitude_min_safe_m"))
         self.pool_depth_m = float(g("pool_depth_ft")) * FT_TO_M
+        self.hard_code = bool(g("hard_code_enable"))
+        self.hard_down_m = float(g("hard_code_down_distance")) * FT_TO_M
+        self.hard_forward_m = float(g("hard_code_forward_distance")) * FT_TO_M
         self._fake_until = None   # lazily set on first gate check, not at startup
 
         # INS state. Under sim_sensors these are seeded live (not None/0)
@@ -315,6 +351,12 @@ class Qualify(Node):
 
         if self.dry_run:
             self._log("warn", "DRY RUN: no arm, no thrust published.")
+        if self.hard_code:
+            self._log("warn",
+                f"HARD_CODE MODE: no vision, no gate. Descend "
+                f"{self.hard_down_m / FT_TO_M:.1f}ft ({self.hard_down_m:.2f}m) below launch "
+                f"altitude, then drive forward {self.hard_forward_m / FT_TO_M:.1f}ft "
+                f"({self.hard_forward_m:.2f}m) on the captured heading, then disarm.")
         if self.sim_sensors:
             self._log("warn",
                 "SIM_SENSORS: FCU/INS/altimeter are all synthetic, integrated from "
@@ -749,12 +791,29 @@ class Qualify(Node):
                 return 1
             self._log("warn", msg + " Proceeding anyway.")
 
-        if not self.wait_for_gate():
+        if self.hard_code:
+            # No vision. wait_for_gate() is where mission_start is stamped and
+            # where the hands-off arm countdown lives; hard-code skips the gate
+            # wait but keeps the countdown -- arming with no warning window is
+            # the one thing the vision path is careful never to do.
+            self._log("warn",
+                f"HARD_CODE: no gate wait. ARMING IN {self.arm_delay:.0f}s -- HANDS OFF.")
+            t_end = time.time() + self.arm_delay
+            while time.time() < t_end:
+                rclpy.spin_once(self, timeout_sec=0.1)
+                if self._abort_req:
+                    self._log("error", "Aborted during arm countdown.")
+                    return 1
+                remain = t_end - time.time()
+                if remain > 0 and abs(remain - round(remain)) < 0.06:
+                    self._log("warn", f"  arming in {round(remain)}...")
+            self.mission_start = time.time()
+        elif not self.wait_for_gate():
             return 1
 
         if math.isnan(self.gate_heading):
             self.gate_heading = self.heading
-            self._log("info", f"Gate heading CAPTURED: {self.gate_heading:.1f}")
+            self._log("info", f"Run heading CAPTURED: {self.gate_heading:.1f}")
         self.origin = self.pos
 
         self.enter("ARM")
@@ -775,9 +834,15 @@ class Qualify(Node):
             return 1
 
         try:
-            self.seek_altitude()
-            self.settle()
-            self.drive_to_gate()
+            if self.hard_code:
+                self._prepare_hard_code_descent()   # sets target_altitude_m from launch alt
+                self.seek_altitude()                # same descent loop + safety as vision path
+                self.settle()
+                self.hard_code_forward()            # dead-reckoned forward, no vision
+            else:
+                self.seek_altitude()
+                self.settle()
+                self.drive_to_gate()
         except Abort as e:
             return self.abort(str(e))
 
@@ -979,6 +1044,55 @@ class Qualify(Node):
                 f"error {error:+.2f}m  rate {rate}  age {age:.2f}s  "
                 f"z {z:.0f} (neutral {Z_NEUTRAL:.0f}, delta {z - Z_NEUTRAL:+.0f})"))
             self.tick(0.0, self.yaw_to(self.gate_heading), z=z)
+
+    def _prepare_hard_code_descent(self):
+        """HARD_CODE mode: turn 'descend N ft' into the absolute target
+        altitude that seek_altitude() already knows how to reach, so the
+        whole descent -- safety floor, backwards-sign backstops,
+        STABILIZE->ALT_HOLD handoff -- is the exact same code the vision
+        path uses. Waits for one altimeter reading to learn the launch
+        altitude, subtracts the requested descent, and clamps so the target
+        never sits below the safety floor (better to stop short than to
+        drive at the bottom)."""
+        if not self.spin_until(lambda: self.altimeter_distance is not None,
+                               10.0, "altimeter"):
+            raise Abort("no altimeter data -- cannot descend")
+        start_alt = self.altimeter_distance
+        target = start_alt - self.hard_down_m
+        floor = self.altitude_min_safe_m + ALTITUDE_TOLERANCE_M
+        if target < floor:
+            self._log("warn",
+                f"HARD_CODE: descending {self.hard_down_m:.2f}m from launch altitude "
+                f"{start_alt:.2f}m would breach the {self.altitude_min_safe_m:.2f}m safety "
+                f"floor -- stopping at {floor:.2f}m above the floor instead "
+                f"(only {start_alt - floor:.2f}m of descent).")
+            target = floor
+        self.target_altitude_m = target
+        self._log("info",
+            f"HARD_CODE descend: launch altitude {start_alt:.2f}m -> target "
+            f"{target:.2f}m above floor (descend {start_alt - target:.2f}m).")
+
+    def hard_code_forward(self):
+        """HARD_CODE mode's forward phase: drive hard_code_forward_distance
+        on the captured heading using the SAME dead-reckoned INS projection
+        (along_cross) blind_push and the vision overshoot use, then stop.
+        No vision, no range -- purely 'go this many metres forward'."""
+        self.enter("HARD_CODE_FORWARD")
+        self._log("info",
+            f"moving forward {self.hard_forward_m:.2f}m on heading "
+            f"{self.gate_heading:.1f}")
+        a0, _ = self.along_cross()
+        while True:
+            along, _ = self.along_cross()
+            travelled = along - a0
+            if travelled >= self.hard_forward_m:
+                self._log("info",
+                    f"HARD_CODE: reached {travelled:.2f}m forward. Stopping.")
+                return
+            self.log_every("hard_code_forward", 2.0, lambda: (
+                f"  forward {along - a0:+.2f}m / {self.hard_forward_m:.2f}m  "
+                f"hdg {self.heading:.1f}"))
+            self.tick(self.cruise_v, self.yaw_to(self.gate_heading), z=Z_NEUTRAL)
 
     def settle(self):
         """Hold heading, no forward thrust. There is no depth logic here:
