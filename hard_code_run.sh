@@ -2,35 +2,44 @@
 # ============================================================
 # hard_code_run.sh - one-command dead-reckoned qualify.
 #
-#   Descend HARD_CODE_DOWN_FEET below the launch altitude, then drive
-#   HARD_CODE_FORWARD_FEET forward on the heading captured at arm, then
-#   disarm. No vision, no gate, no camera -- this is the minimum needed to
-#   qualify (get down, get through). It drives qualify.py's hard-code mode;
-#   see the module docstring in qualify.py for the details and cautions.
+# Defaults to OPEN-LOOP timed mode: no vision, and NO DVL/altimeter/INS
+# position -- just thrust DOWN for a set time, let ALT_HOLD (the Cube's
+# barometer, independent of the DVL) hold depth, then thrust FORWARD for a
+# set time on the captured compass heading, then disarm. This is the robust
+# minimum for qualifying when the DVL is unreliable: dip below a near-surface
+# gate, hold depth, drive through. Amounts are SECONDS, not distance -- tune
+# them by watching the pool. See qualify.py's module docstring for detail.
 #
-# EDIT THE THREE TOGGLES BELOW, then on the Jetson just run:
+# EDIT THE TOGGLES BELOW, then on the Jetson (with MAVROS running) run:
 #
 #     ./hard_code_run.sh
 #
-# Bench test above water first (no MAVROS/Nucleus/camera needed -- fabricates
-# every sensor and refuses to arm or thrust):
+# Bench test above water first, no hardware, refuses to arm or thrust:
 #
 #     ./hard_code_run.sh -p sim_sensors:=true
 #
-# Any extra args after the script name are passed straight through to
-# qualify.py, so you can also override the toggles without editing this file:
+# Bench HARDWARE-IN-THE-LOOP (thrusters WILL spin, MAVROS must be up, props
+# clear):
 #
-#     ./hard_code_run.sh -p hard_code_down_distance:=4 -p hard_code_forward_distance:=8
+#     ./hard_code_run.sh -p sim_sensors:=true -p sim_thrust:=true
+#
+# If "down" makes it RISE, the z direction is backwards -- flip the sign:
+#
+#     ./hard_code_run.sh -p altitude_sign:=-1.0
+#
+# Any extra args after the script name pass straight through to qualify.py.
 # ============================================================
 # NOTE: no 'set -u' here. ROS setup.bash references unbound variables
 # (AMENT_TRACE_SETUP_FILES etc.), and nounset makes sourcing it abort.
 set -o pipefail
 
-# ---- THE THREE TOGGLES ----
-HARD_CODE_ENABLE=true      # false -> normal (vision) qualify run
-HARD_CODE_DOWN_FEET=3.0    # ft to descend below the launch altitude
-HARD_CODE_FORWARD_FEET=10.0  # ft to drive forward on the captured heading
-# ---------------------------
+# ---- THE TOGGLES (open-loop timed) ----
+HARD_CODE_ENABLE=true       # false -> normal (vision) qualify run
+OPEN_LOOP=true              # true -> ignore DVL/altimeter/INS pos, use timed thrust
+DESCEND_SECONDS=4.0         # s to thrust DOWN (keep short; ALT_HOLD then holds depth)
+DESCEND_THRUST=0.4          # down-thrust fraction of full authority (0-1)
+FORWARD_SECONDS=8.0         # s to thrust FORWARD through the gate
+# ---------------------------------------
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -39,11 +48,13 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f /opt/ros/humble/setup.bash ] && source /opt/ros/humble/setup.bash
 [ -f "$HOME/nautilus_ws/install/setup.bash" ] && source "$HOME/nautilus_ws/install/setup.bash"
 
-echo "hard_code_run.sh: enable=$HARD_CODE_ENABLE down=${HARD_CODE_DOWN_FEET}ft forward=${HARD_CODE_FORWARD_FEET}ft"
+echo "hard_code_run.sh: enable=$HARD_CODE_ENABLE open_loop=$OPEN_LOOP down=${DESCEND_SECONDS}s@${DESCEND_THRUST} forward=${FORWARD_SECONDS}s"
 echo "extra args: $*"
 
 exec python3 "$DIR/qualify.py" --ros-args \
   -p hard_code_enable:="$HARD_CODE_ENABLE" \
-  -p hard_code_down_distance:="$HARD_CODE_DOWN_FEET" \
-  -p hard_code_forward_distance:="$HARD_CODE_FORWARD_FEET" \
+  -p hard_code_open_loop:="$OPEN_LOOP" \
+  -p hard_code_descend_seconds:="$DESCEND_SECONDS" \
+  -p hard_code_descend_thrust:="$DESCEND_THRUST" \
+  -p hard_code_forward_seconds:="$FORWARD_SECONDS" \
   "$@"

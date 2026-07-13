@@ -46,20 +46,31 @@ The INS owns heading and supplies the sanity bounds that abort the run if we
 drive somewhere absurd.
 
 hard_code_enable:=true is the dead-reckoned qualify path -- NO vision, no
-gate, no camera. It descends hard_code_down_distance feet below the launch
-altitude, then drives hard_code_forward_distance feet forward on the heading
-captured at arm, then disarms. It reuses the exact same altimeter descent
-loop as SEEK_ALTITUDE (same safety floor, same backwards-sign backstops,
-same STABILIZE->ALT_HOLD handoff) and the same INS dead-reckoning
-(along_cross) the vision path uses for GATE_OVERSHOOT -- it just aims at
-fixed distances instead of at what the camera sees. This is the minimum
-needed to qualify (get down, get through) and is what to run when vision
-isn't ready. The three toggles are module constants below AND ROS
-parameters of the same name, so one CLI command sets them (see
-hard_code_run.sh for a one-command wrapper). "Down" is measured as the
-altimeter reading shrinking, so on a flat floor it equals a depth increase;
-it still depends on the altimeter, so the same altitude_sign / safety-floor
-cautions apply.
+gate, no camera. It has two flavors:
+
+  * DEFAULT (altimeter): descend hard_code_down_distance feet below the
+    launch altitude, then drive hard_code_forward_distance feet forward,
+    reusing SEEK_ALTITUDE's altimeter loop (safety floor, backwards-sign
+    backstops) and the INS dead-reckoning the vision path uses. Depends on
+    the altimeter and INS position being trustworthy.
+
+  * hard_code_open_loop:=true (TIMED, no DVL): for when the DVL/altimeter
+    AND INS position CANNOT be trusted. Command down-thrust for
+    hard_code_descend_seconds, hand off to ALT_HOLD (the Cube's barometer --
+    a different sensor from the DVL -- holds that depth), then command
+    forward-thrust for hard_code_forward_seconds. Reads NO altimeter and NO
+    INS position; only compass heading, to go straight. Amounts are TIME,
+    not distance, because there is no trusted sensor to measure distance
+    with -- tune the seconds in the pool. "Down" direction still obeys
+    altitude_sign. This is the robust minimum for qualifying with a bad DVL:
+    dip below a near-surface gate, hold depth on the barometer, drive
+    through. There is no altimeter safety floor in this mode, so keep the
+    descent time short; ALT_HOLD stops the descent once it takes over.
+
+Either flavor is the minimum needed to qualify (get down, get through) and
+is what to run when vision isn't ready. Toggles are module constants below
+AND ROS parameters of the same name; hard_code_run.sh wraps them into one
+command.
 
 sim_sensors:=true fabricates FCU/INS/altimeter data too, so the whole state
 machine (WAIT_FCU -> ... -> SEEK_ALTITUDE -> SETTLE -> DRIVE_TO_GATE ->
@@ -84,6 +95,10 @@ vehicle.
         # below GATE_PASS_RANGE (1.6) or the simulated gate never closes
         # enough to finish drive_to_gate() -- expect ~15-20s to reach it,
         # that's FAKE_GATE_SECONDS playing out, not a hang.
+    ros2 run nautilus_auto qualify --ros-args -p hard_code_enable:=true -p hard_code_open_loop:=true
+        # TIMED open-loop qualify: ignores DVL/altimeter/INS position entirely,
+        # just thrusts down then forward on a clock (compass heading only). Use
+        # when the DVL is unreliable. Tune the *_seconds params in the pool.
     ros2 run nautilus_auto qualify --ros-args -p hard_code_enable:=true -p sim_sensors:=true -p sim_thrust:=true
         # bench HARDWARE-IN-THE-LOOP: fake sensors drive the sequence but the
         # vehicle ACTUALLY ARMS and the thrusters ACTUALLY SPIN, to confirm the
@@ -192,11 +207,22 @@ SIM_ALT_TRUTH_SIGN = 1.0    # the simulator's OWN made-up ground truth for which
 #       -p hard_code_down_distance:=3 -p hard_code_forward_distance:=10
 # or just run hard_code_run.sh, which wraps exactly that.
 HARD_CODE_ENABLE = False               # master switch. true -> skip vision entirely:
-                                       # descend a fixed distance, drive forward a fixed
-                                       # distance, disarm. Default false so a normal
-                                       # (vision) run is unaffected unless asked for.
-HARD_CODE_DOWN_DISTANCE_FT = 3.0       # ft to descend BELOW the launch altitude
-HARD_CODE_FORWARD_DISTANCE_FT = 10.0   # ft to drive forward on the captured heading
+                                       # descend, drive forward, disarm. Default false so a
+                                       # normal (vision) run is unaffected unless asked for.
+HARD_CODE_DOWN_DISTANCE_FT = 3.0       # ft to descend BELOW the launch altitude (altimeter path)
+HARD_CODE_FORWARD_DISTANCE_FT = 10.0   # ft to drive forward on the captured heading (altimeter path)
+
+# OPEN-LOOP hard-code (hard_code_open_loop:=true). For when the DVL/altimeter
+# AND INS position can't be trusted: command the thrusters down for a fixed
+# TIME, hand off to ALT_HOLD (the Cube's barometer, independent of the DVL,
+# holds that depth), then command them forward for a fixed TIME. NO altimeter,
+# NO INS position -- only compass heading, to go straight. Amounts are seconds,
+# not distance: there is no trusted sensor to measure distance with, so you
+# tune the times by watching the pool. Direction of "down" obeys altitude_sign.
+HARD_CODE_OPEN_LOOP = False             # true -> timed open-loop descent+forward (ignore DVL)
+HARD_CODE_DESCEND_SECONDS = 4.0         # s to command down-thrust (keep short; ALT_HOLD then holds)
+HARD_CODE_DESCEND_THRUST = 0.4          # fraction of full z authority (0-1); 0.4 -> 200 off neutral
+HARD_CODE_FORWARD_SECONDS = 8.0         # s to command forward-thrust through the gate
 
 # Fixed tuning constants. These get set once from pool testing and rarely
 # change between runs -- edit them here rather than adding another ROS
@@ -264,6 +290,10 @@ class Qualify(Node):
         d("hard_code_enable", HARD_CODE_ENABLE)               # dead-reckoned down-then-forward, no vision
         d("hard_code_down_distance", HARD_CODE_DOWN_DISTANCE_FT)      # ft to descend below launch altitude
         d("hard_code_forward_distance", HARD_CODE_FORWARD_DISTANCE_FT)  # ft to drive forward on captured heading
+        d("hard_code_open_loop", HARD_CODE_OPEN_LOOP)         # timed thrust, ignore DVL/altimeter/INS pos
+        d("hard_code_descend_seconds", HARD_CODE_DESCEND_SECONDS)   # open-loop: s of down-thrust
+        d("hard_code_descend_thrust", HARD_CODE_DESCEND_THRUST)     # open-loop: down-thrust fraction 0-1
+        d("hard_code_forward_seconds", HARD_CODE_FORWARD_SECONDS)   # open-loop: s of forward-thrust
 
         g = lambda n: self.get_parameter(n).value
         self.dry_run = bool(g("dry_run"))
@@ -295,6 +325,10 @@ class Qualify(Node):
         self.hard_code = bool(g("hard_code_enable"))
         self.hard_down_m = float(g("hard_code_down_distance")) * FT_TO_M
         self.hard_forward_m = float(g("hard_code_forward_distance")) * FT_TO_M
+        self.hc_open_loop = bool(g("hard_code_open_loop"))
+        self.hc_descend_seconds = float(g("hard_code_descend_seconds"))
+        self.hc_descend_thrust = clamp(float(g("hard_code_descend_thrust")), 0.0, 1.0)
+        self.hc_forward_seconds = float(g("hard_code_forward_seconds"))
         self._fake_until = None   # lazily set on first gate check, not at startup
 
         # INS state. Under sim_sensors these are seeded live (not None/0)
@@ -369,7 +403,14 @@ class Qualify(Node):
 
         if self.dry_run:
             self._log("warn", "DRY RUN: no arm, no thrust published.")
-        if self.hard_code:
+        if self.hard_code and self.hc_open_loop:
+            self._log("warn",
+                f"HARD_CODE OPEN-LOOP: no vision, and NO DVL/altimeter/INS-position -- "
+                f"timed thrust only. Down-thrust {self.hc_descend_thrust:.2f} for "
+                f"{self.hc_descend_seconds:.1f}s, then ALT_HOLD holds depth, then forward "
+                f"for {self.hc_forward_seconds:.1f}s on the captured heading, then disarm. "
+                f"Amounts are TIME (tune in the pool), not distance.")
+        elif self.hard_code:
             self._log("warn",
                 f"HARD_CODE MODE: no vision, no gate. Descend "
                 f"{self.hard_down_m / FT_TO_M:.1f}ft ({self.hard_down_m:.2f}m) below launch "
@@ -859,7 +900,11 @@ class Qualify(Node):
             return 1
 
         try:
-            if self.hard_code:
+            if self.hard_code and self.hc_open_loop:
+                self.hard_code_descend_timed()      # timed down-thrust, no altimeter
+                self.settle()
+                self.hard_code_forward_timed()      # timed forward-thrust, no INS position
+            elif self.hard_code:
                 self._prepare_hard_code_descent()   # sets target_altitude_m from launch alt
                 self.seek_altitude()                # same descent loop + safety as vision path
                 self.settle()
@@ -1069,6 +1114,55 @@ class Qualify(Node):
                 f"error {error:+.2f}m  rate {rate}  age {age:.2f}s  "
                 f"z {z:.0f} (neutral {Z_NEUTRAL:.0f}, delta {z - Z_NEUTRAL:+.0f})"))
             self.tick(0.0, self.yaw_to(self.gate_heading), z=z)
+
+    def hard_code_descend_timed(self):
+        """OPEN-LOOP descent (hard_code_open_loop): command down-thrust for a
+        fixed time, IGNORING the altimeter entirely -- for when the
+        DVL/altimeter can't be trusted. Holds heading throughout. Which way
+        is "down" obeys altitude_sign (if the vehicle RISES, flip it). After
+        the timed push it hands off to ALT_HOLD so the Cube's OWN barometer
+        -- a different sensor from the DVL, unaffected by the DVL being bad --
+        holds the reached depth for the forward run. Keep the time short: the
+        only thing stopping the descent is the clock, there is no altimeter
+        safety floor here.
+
+        Runs in STABILIZE (set in run() before this), which gives z a direct
+        thruster response; ALT_HOLD's rate-limited z would be too gentle.
+        """
+        self.enter("HARD_CODE_DESCEND")
+        z = clamp(Z_NEUTRAL - self.altitude_sign * self.hc_descend_thrust * 500.0,
+                  0.0, 1000.0)
+        self._log("warn",
+            f"OPEN-LOOP descend: z={z:.0f} (delta {z - Z_NEUTRAL:+.0f}) for "
+            f"{self.hc_descend_seconds:.1f}s -- NO altimeter feedback. "
+            f"If the vehicle RISES instead, flip altitude_sign.")
+        t_end = time.time() + self.hc_descend_seconds
+        while time.time() < t_end:
+            self.log_every("hc_descend", 1.0, lambda: (
+                f"  descending open-loop  z {z:.0f}  {t_end - time.time():.1f}s left  "
+                f"hdg {self.heading:.1f}"))
+            self.tick(0.0, self.yaw_to(self.gate_heading), z=z)
+        # Hand the reached depth to ALT_HOLD (barometer-based, DVL-independent).
+        self.publish(0.0, self.yaw_to(self.gate_heading), z=Z_NEUTRAL)
+        if not self.set_mode("ALT_HOLD"):
+            raise Abort("could not switch to ALT_HOLD after open-loop descent")
+        self._log("info", "OPEN-LOOP descend done. ALT_HOLD (barometer) now holding depth.")
+
+    def hard_code_forward_timed(self):
+        """OPEN-LOOP forward (hard_code_open_loop): drive forward at cruise
+        for a fixed time, holding heading, with NO position feedback -- for
+        when INS position (DVL dead-reckoning) can't be trusted. Time, not
+        distance: tune hard_code_forward_seconds in the pool."""
+        self.enter("HARD_CODE_FORWARD")
+        self._log("info",
+            f"OPEN-LOOP forward: cruise for {self.hc_forward_seconds:.1f}s on heading "
+            f"{self.gate_heading:.1f} -- NO position feedback.")
+        t_end = time.time() + self.hc_forward_seconds
+        while time.time() < t_end:
+            self.log_every("hc_forward_timed", 1.0, lambda: (
+                f"  forward open-loop  {t_end - time.time():.1f}s left  hdg {self.heading:.1f}"))
+            self.tick(self.cruise_v, self.yaw_to(self.gate_heading), z=Z_NEUTRAL)
+        self._log("info", "OPEN-LOOP forward done.")
 
     def _prepare_hard_code_descent(self):
         """HARD_CODE mode: turn 'descend N ft' into the absolute target
