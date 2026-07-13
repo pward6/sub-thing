@@ -28,19 +28,19 @@ echo "[autostart] bringing up stack (nautilus_up.sh)"
 ./nautilus_up.sh &
 STACK_PID=$!
 
-echo "[autostart] waiting for INS topic + MAVROS arming SERVICE (up to 180s)"
+echo "[autostart] waiting for INS + MAVROS state topics (up to 180s)"
 END=$(( $(date +%s) + 180 ))
-until ros2 topic list   2>/dev/null | grep -q "/nucleus_node/ins_packets" \
-   && ros2 service list 2>/dev/null | grep -q "/mavros/cmd/arming"; do
+until ros2 topic list 2>/dev/null | grep -q "/nucleus_node/ins_packets" \
+   && ros2 topic list 2>/dev/null | grep -q "/mavros/state"; do
   if [ "$(date +%s)" -gt "$END" ]; then
-    echo "[autostart] stack/arm-service not ready within 180s -- aborting, NOT arming."
+    echo "[autostart] stack not ready within 180s -- aborting, NOT arming."
     kill "$STACK_PID" 2>/dev/null
     exit 1
   fi
   sleep 2
 done
-echo "[autostart] INS + arm service up. Settling 5s before launch."
-sleep 5
+echo "[autostart] stack up. Settling 10s for services to advertise."
+sleep 10
 echo "[autostart] launching hard-code mission."
 
 # ---- MISSION PARAMS (tune here) ----
