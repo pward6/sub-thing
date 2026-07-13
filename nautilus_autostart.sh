@@ -54,9 +54,19 @@ until ros2 topic list 2>/dev/null | grep -q "/nucleus_node/ins_packets" \
   fi
   sleep 2
 done
-echo "[autostart] stack up. Settling 10s for services to advertise."
+echo "[autostart] topics seen (daemon cache). Settling 10s."
 sleep 10
-echo "[autostart] launching hard-code mission."
+
+# ros2 topic list reads the ROS daemon's CACHED graph, so it can report topics
+# whose publisher already died. Verify the actual processes are alive before
+# launching qualify.py -- otherwise we'd arm against a dead stack.
+if ! pgrep -f mavros_node >/dev/null || ! pgrep -f nucleus_node >/dev/null; then
+  echo "[autostart] STACK DIED after coming up (mavros/nucleus not running). NOT arming."
+  echo "[autostart]   mavros pids: [$(pgrep -f mavros_node | tr '\n' ' ')]  nucleus pids: [$(pgrep -f nucleus_node | tr '\n' ' ')]  router: [$(pgrep mavlink-routerd | tr '\n' ' ')]"
+  echo "[autostart]   -> the stack is not staying up. See the [stack] lines above for why (MAVROS connect? Nucleus 'too many connections'?)."
+  exit 1
+fi
+echo "[autostart] stack processes alive. Launching hard-code mission."
 
 # ---- MISSION PARAMS (tune here) ----
 python3 scripts/qualify.py --ros-args \
