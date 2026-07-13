@@ -73,14 +73,30 @@ tmux send-keys -t "$SESSION":shell \
 
 # ---- window 4: autonomous mission ----
 # Only when explicitly asked. The systemd unit sets NAUTILUS_AUTOSTART=1;
-# running this script by hand does not.
+# running this script by hand does not (enable/disable that unit is the
+# testbench<->live toggle). Runs the hard-code OPEN-LOOP qualify: no vision,
+# no DVL/altimeter, no INS position -- timed down-thrust, ALT_HOLD on the
+# barometer, timed forward-thrust.
+#
+# *** SAFETY: this ARMS AND DRIVES on its own once the stack is up. The
+# HARDWARE KILL SWITCH is the interlock -- keep it engaged whenever the sub
+# is powered for anything other than a deployed run. After the ~20s stack
+# wait there is a further arm_delay countdown (set high here) as the deploy
+# window before thrusters arm. ***
+#
+# Tune the *_seconds/thrust values here to match your pool and gate depth.
 if [ "${NAUTILUS_AUTOSTART:-0}" = "1" ]; then
   tmux new-window -t "$SESSION" -n mission
   tmux send-keys -t "$SESSION":mission \
-    "$SRC && sleep 20 && python3 $SCRIPTS/gate_pass.py --ros-args \
-      -p forward_thrust:=0.30 \
+    "$SRC && sleep 20 && python3 $SCRIPTS/qualify.py --ros-args \
+      -p hard_code_enable:=true \
+      -p hard_code_open_loop:=true \
+      -p hard_code_descend_seconds:=4.0 \
+      -p hard_code_descend_thrust:=0.4 \
+      -p hard_code_forward_seconds:=8.0 \
+      -p arm_delay:=30.0 \
       2>&1 | tee -a $BAGS/mission_\$(date +%F_%H%M%S).log" C-m
-  echo "AUTOSTART: mission node will arm as soon as FCU + INS heading are ready -- no gate sighting, no countdown."
+  echo "AUTOSTART: hard-code OPEN-LOOP mission. Arms after ~20s stack wait + 30s deploy countdown. KILL SWITCH is the interlock."
 fi
 
 echo "started. attach with:  tmux attach -t $SESSION"

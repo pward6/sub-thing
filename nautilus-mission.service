@@ -1,0 +1,44 @@
+# nautilus-mission.service - autonomous hard-code qualify on boot.
+#
+# Runs nautilus_session.sh with NAUTILUS_AUTOSTART=1 on every boot, which
+# brings up the stack (router/MAVROS/Nucleus) and then, after a stack wait +
+# a 30s deploy countdown, runs the hard-code OPEN-LOOP qualify autonomously.
+#
+# *** THE HARDWARE KILL SWITCH IS THE INTERLOCK. With this unit ENABLED, every
+# power-on marches toward arming and driving thrusters. Keep the kill switch
+# engaged whenever the sub is powered for anything but a deployed run. ***
+#
+# TESTBENCH <-> LIVE toggle (this is the "CLI toggle" you wanted):
+#     sudo systemctl enable  nautilus-mission     # LIVE: runs on every boot
+#     sudo systemctl disable nautilus-mission     # TESTBENCH: boots do nothing
+#     sudo systemctl start   nautilus-mission     # run now (this boot)
+#     sudo systemctl stop    nautilus-mission     # kill the running mission
+#     systemctl status nautilus-mission ; journalctl -u nautilus-mission -f
+#
+# INSTALL:
+#     sudo cp ~/nautilus_ws/scripts/nautilus-mission.service /etc/systemd/system/
+#     sudo systemctl daemon-reload
+#     # then enable/disable per above. Adjust User= and paths if yours differ.
+#
+# BEFORE ENABLING ON BOOT: test the launcher by hand first, kill switch
+# engaged, and confirm the mission window comes up and runs:
+#     NAUTILUS_AUTOSTART=1 ~/nautilus_ws/scripts/nautilus_session.sh
+#     tmux attach -t nautilus        # watch it; Ctrl+B then D to detach
+
+[Unit]
+Description=Nautilus autonomous hard-code qualify mission
+After=multi-user.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=nano
+# tmux daemonizes its server; don't let systemd reap it when ExecStart exits.
+KillMode=none
+Environment=NAUTILUS_AUTOSTART=1
+ExecStart=/home/nano/nautilus_ws/scripts/nautilus_session.sh
+ExecStop=/usr/bin/tmux kill-session -t nautilus
+
+[Install]
+WantedBy=multi-user.target
