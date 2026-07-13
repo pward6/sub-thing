@@ -80,7 +80,7 @@ python3 scripts/qualify.py --ros-args \
   -p hard_code_descend_thrust:=0.4 \
   -p hard_code_forward_seconds:=8.0 \
   -p altitude_sign:=-1.0 \
-  -p arm_delay:=30.0
+  -p arm_delay:=5.0
 
 echo "[autostart] mission finished. Tearing down stack."
 # trap kill_stack runs on exit
