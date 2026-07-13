@@ -22,7 +22,9 @@
 #
 #     ./hard_code_run.sh -p hard_code_down_distance:=4 -p hard_code_forward_distance:=8
 # ============================================================
-set -uo pipefail
+# NOTE: no 'set -u' here. ROS setup.bash references unbound variables
+# (AMENT_TRACE_SETUP_FILES etc.), and nounset makes sourcing it abort.
+set -o pipefail
 
 # ---- THE THREE TOGGLES ----
 HARD_CODE_ENABLE=true      # false -> normal (vision) qualify run
