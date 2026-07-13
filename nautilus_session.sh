@@ -41,8 +41,9 @@ TOPICS="/mavros/state /mavros/imu/data /mavros/battery \
 mkdir -p "$BAGS"
 
 if tmux has-session -t "$SESSION" 2>/dev/null; then
-  echo "session '$SESSION' already exists. tmux attach -t $SESSION"
-  exit 0
+  echo "existing session '$SESSION' found — closing it"
+  tmux kill-session -t "$SESSION"
+  sleep 2
 fi
 
 # Keep panes alive after a command exits so you can read the error.
