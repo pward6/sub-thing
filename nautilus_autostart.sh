@@ -17,17 +17,25 @@ source /opt/ros/humble/setup.bash
 [ -f "$HOME/nautilus_ws/install/setup.bash" ] && source "$HOME/nautilus_ws/install/setup.bash"
 cd "$HOME/nautilus_ws" || exit 1
 
+# Kill the WHOLE stack, not just nautilus_up.sh: it backgrounds router/MAVROS/
+# Nucleus, so killing only its PID orphans them and they keep holding the FCU
+# serial + UDP ports 14540/14555 -> next run fails "port still in use".
+kill_stack() {
+  pkill -9 -f mavros_node   2>/dev/null
+  pkill -9 -f nucleus_node  2>/dev/null
+  pkill -9 mavlink-routerd  2>/dev/null
+  pkill -9 -f qualify.py    2>/dev/null
+}
+# Always clean up on exit (timeout, mission end, or systemd stop).
+trap kill_stack EXIT
+
 echo "[autostart] clearing any leftover stack/mission processes"
-pkill -9 -f mavros_node   2>/dev/null
-pkill -9 -f nucleus_node  2>/dev/null
-pkill -9 mavlink-routerd  2>/dev/null
-pkill -9 -f qualify.py    2>/dev/null
-sleep 2
+kill_stack
+sleep 3   # let the UDP ports 14540/14555 actually release before preflight
 
 # FastRTPS (the default RMW) keeps shared-memory segments in /dev/shm. Stale
 # ones left by repeated restarts break SERVICE discovery (topics still work),
 # which shows up as "arm: service unavailable" even though the stack is up.
-# Safe to remove here -- all ROS processes were just killed above.
 echo "[autostart] clearing stale FastRTPS shared-memory segments"
 rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* /dev/shm/*fastdds* 2>/dev/null
 sleep 1
@@ -42,8 +50,7 @@ until ros2 topic list 2>/dev/null | grep -q "/nucleus_node/ins_packets" \
    && ros2 topic list 2>/dev/null | grep -q "/mavros/state"; do
   if [ "$(date +%s)" -gt "$END" ]; then
     echo "[autostart] stack not ready within 180s -- aborting, NOT arming."
-    kill "$STACK_PID" 2>/dev/null
-    exit 1
+    exit 1   # trap kill_stack runs
   fi
   sleep 2
 done
@@ -62,4 +69,4 @@ python3 scripts/qualify.py --ros-args \
 # add  -p altitude_sign:=-1.0  above if it needs the inverted down direction
 
 echo "[autostart] mission finished. Tearing down stack."
-kill "$STACK_PID" 2>/dev/null
+# trap kill_stack runs on exit
