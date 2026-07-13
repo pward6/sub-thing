@@ -39,6 +39,17 @@ User=nano
 # ExecStop below kills the tmux session first for a graceful stop.
 KillMode=mixed
 Environment=NAUTILUS_AUTOSTART=1
+# Clear any stale tmux session + leftover stack processes BEFORE launching, so
+# nautilus_session.sh never hits its "session already exists" guard and skips
+# the mission, and so MAVROS comes up on a clean serial port. Leading '-' =
+# ignore failure (nothing to kill is fine). nautilus_up.sh also pkills these,
+# but doing it here guarantees a clean slate even if the launch script's guard
+# would have exited first.
+ExecStartPre=-/usr/bin/tmux kill-session -t nautilus
+ExecStartPre=-/usr/bin/pkill -9 -f mavros_node
+ExecStartPre=-/usr/bin/pkill -9 -f nucleus_node
+ExecStartPre=-/usr/bin/pkill -9 mavlink-routerd
+ExecStartPre=/bin/sleep 2
 ExecStart=/home/nano/nautilus_ws/scripts/nautilus_session.sh
 # Leading '-' so a missing session (nothing to kill) is not treated as a
 # failure. NOTE: this is oneshot+RemainAfterExit, so to RE-RUN it you must
