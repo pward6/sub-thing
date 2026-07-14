@@ -1165,13 +1165,30 @@ class Qualify(Node):
         Run the down thrusters at 0.45 and set forward/yaw thrust
         to zero for S seconds.
 
+    turn:S:Ty
+        Run the down thrusters at 0.45, set forward thrust to zero,
+        and yaw left at thrust Ty for S seconds.
+
+        The turn duration must be tuned in the pool until it produces
+        approximately 180 degrees of rotation.
+
     All commands run in STABILIZE with no gaps between steps.
     """
 
     self.enter("HARD_CODE_SEQUENCE")
 
     # Every step is normalized to:
-    # (command_name, seconds, down_thrust, forward_thrust)
+    # (
+    #     command_name,
+    #     seconds,
+    #     down_thrust,
+    #     forward_thrust,
+    #     turn_yaw_thrust,
+    # )
+    #
+    # turn_yaw_thrust is signed:
+    # negative = left
+    # positive = right
     steps = []
 
     for tok in self.hc_sequence.split():
@@ -1181,24 +1198,54 @@ class Qualify(Node):
         try:
             if command in ("down", "dn", "d"):
                 seconds = float(p[1])
-                down_thrust = clamp(float(p[2]), 0.0, 1.0)
+                down_thrust = clamp(
+                    float(p[2]),
+                    0.0,
+                    1.0,
+                )
 
                 steps.append(
-                    (command, seconds, down_thrust, 0.0)
+                    (
+                        command,
+                        seconds,
+                        down_thrust,
+                        0.0,
+                        0.0,
+                    )
                 )
 
             elif command in ("fwd", "forward", "fw", "f"):
                 seconds = float(p[1])
-                forward_thrust = clamp(float(p[2]), 0.0, 1.0)
+                forward_thrust = clamp(
+                    float(p[2]),
+                    0.0,
+                    1.0,
+                )
 
                 steps.append(
-                    (command, seconds, 0.0, forward_thrust)
+                    (
+                        command,
+                        seconds,
+                        0.0,
+                        forward_thrust,
+                        0.0,
+                    )
                 )
 
             elif command in ("both", "dive", "drive", "df"):
                 seconds = float(p[1])
-                down_thrust = clamp(float(p[2]), 0.0, 1.0)
-                forward_thrust = clamp(float(p[3]), 0.0, 1.0)
+
+                down_thrust = clamp(
+                    float(p[2]),
+                    0.0,
+                    1.0,
+                )
+
+                forward_thrust = clamp(
+                    float(p[3]),
+                    0.0,
+                    1.0,
+                )
 
                 steps.append(
                     (
@@ -1206,17 +1253,53 @@ class Qualify(Node):
                         seconds,
                         down_thrust,
                         forward_thrust,
+                        0.0,
                     )
                 )
 
             elif command in ("stop", "hold"):
                 seconds = float(p[1])
 
-                # Fixed hover command:
-                # down thrusters = 0.45
-                # forward thrusters = 0.0
+                # Hover command:
+                # down thrust = 0.45
+                # forward thrust = 0
+                # yaw thrust = 0
                 steps.append(
-                    (command, seconds, 0.45, 0.0)
+                    (
+                        command,
+                        seconds,
+                        0.45,
+                        0.0,
+                        0.0,
+                    )
+                )
+
+            elif command in (
+                "turn",
+                "turnleft",
+                "left",
+                "uturn",
+            ):
+                seconds = float(p[1])
+
+                yaw_thrust = clamp(
+                    float(p[2]),
+                    0.0,
+                    1.0,
+                )
+
+                # Hold depth using the same thrust as stop,
+                # apply no forward thrust, and yaw left.
+                #
+                # Negative r is being used as the left-yaw command.
+                steps.append(
+                    (
+                        command,
+                        seconds,
+                        0.45,
+                        0.0,
+                        -yaw_thrust,
+                    )
                 )
 
             else:
@@ -1224,7 +1307,8 @@ class Qualify(Node):
                     "warn",
                     (
                         f"skip step '{tok}' "
-                        "(command must be down/fwd/both/stop)"
+                        "(command must be "
+                        "down/fwd/both/stop/turn)"
                     ),
                 )
 
@@ -1235,13 +1319,16 @@ class Qualify(Node):
                     f"skip bad step '{tok}'. Expected: "
                     "down:seconds:thrust, "
                     "fwd:seconds:thrust, "
-                    "both:seconds:down:fwd, or "
-                    "stop:seconds"
+                    "both:seconds:down:fwd, "
+                    "stop:seconds, or "
+                    "turn:seconds:yaw_thrust"
                 ),
             )
 
     if not steps:
-        raise Abort("hard_code_sequence has no valid steps")
+        raise Abort(
+            "hard_code_sequence has no valid steps"
+        )
 
     self._log(
         "warn",
@@ -1252,13 +1339,15 @@ class Qualify(Node):
                 (
                     f"{command}:{seconds:.0f}s"
                     f"(dn{down_thrust:.2f}/"
-                    f"fw{forward_thrust:.2f})"
+                    f"fw{forward_thrust:.2f}/"
+                    f"yaw{turn_yaw_thrust:.2f})"
                 )
                 for (
                     command,
                     seconds,
                     down_thrust,
                     forward_thrust,
+                    turn_yaw_thrust,
                 ) in steps
             )
         ),
@@ -1269,28 +1358,48 @@ class Qualify(Node):
         seconds,
         down_thrust,
         forward_thrust,
+        turn_yaw_thrust,
     ) in enumerate(steps, 1):
 
-        # Convert normalized thrust fractions to MAVROS controls.
+        # Convert down-thrust fraction into the MAVROS z command.
         z = clamp(
             Z_NEUTRAL
-            - self.altitude_sign * down_thrust * 500.0,
+            - self.altitude_sign
+            * down_thrust
+            * 500.0,
             0.0,
             1000.0,
         )
 
+        # Convert forward-thrust fraction into the MAVROS x command.
         x = forward_thrust * 1000.0
 
-        # A stop command must also disable yaw correction.
-        # Otherwise, a nonzero r command could still actuate the
-        # forward thrusters differentially.
-        if command in ("stop", "hold"):
+        if command in (
+            "turn",
+            "turnleft",
+            "left",
+            "uturn",
+        ):
+            # Direct open-loop left-yaw command.
+            yaw_command = (
+                turn_yaw_thrust * 1000.0
+            )
+
+        elif command in ("stop", "hold"):
+            # Do not allow heading correction to actuate the
+            # forward thrusters during stop.
             yaw_command = 0.0
+
         else:
-            yaw_command = self.yaw_to(self.gate_heading)
+            # Normal heading hold for down/fwd/both.
+            yaw_command = self.yaw_to(
+                self.gate_heading
+            )
 
         label = (
-            f"x={x:.0f} z={z:.0f} r={yaw_command:.0f}"
+            f"x={x:.0f} "
+            f"z={z:.0f} "
+            f"r={yaw_command:.0f}"
         )
 
         self._log(
@@ -1299,7 +1408,8 @@ class Qualify(Node):
                 f" step {i}/{len(steps)}: "
                 f"{command} {seconds:.1f}s "
                 f"down {down_thrust:.2f} / "
-                f"fwd {forward_thrust:.2f} "
+                f"fwd {forward_thrust:.2f} / "
+                f"yaw {turn_yaw_thrust:.2f} "
                 f"({label})"
             ),
         )
@@ -1327,7 +1437,7 @@ class Qualify(Node):
                 z=z,
             )
 
-        # No delay or neutral command between sequence steps.
+        # No delay or neutral command between steps.
 
     self._log(
         "info",
