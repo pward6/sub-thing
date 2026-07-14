@@ -85,7 +85,7 @@ python3 scripts/qualify.py --ros-args \
   -p no_nucleus:=true \
   -p hard_code_descend_seconds:=4.0 \
   -p hard_code_descend_thrust:=0.4 \
-  -p hard_code_forward_seconds:=20.0 \
+  -p hard_code_forward_seconds:=2.0 \
   -p hard_code_forward_downthrust:=0.6 \
   -p altitude_sign:=1.0 \
   -p arm_delay:=5.0
