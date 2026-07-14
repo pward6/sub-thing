@@ -297,8 +297,6 @@ class Qualify(Node):
         d("hard_code_descend_seconds", HARD_CODE_DESCEND_SECONDS)   # open-loop: s of down-thrust
         d("hard_code_descend_thrust", HARD_CODE_DESCEND_THRUST)     # open-loop: down-thrust fraction 0-1
         d("hard_code_forward_seconds", HARD_CODE_FORWARD_SECONDS)   # open-loop: s of forward-thrust
-        d("hard_code_forward_downthrust", 0.0)   # open-loop: down-thrust (0-1) held DURING forward to
-                                                 # counteract buoyancy (no baro). 0 = pure forward.
 
         g = lambda n: self.get_parameter(n).value
         self.dry_run = bool(g("dry_run"))
@@ -335,7 +333,6 @@ class Qualify(Node):
         self.hc_descend_seconds = float(g("hard_code_descend_seconds"))
         self.hc_descend_thrust = clamp(float(g("hard_code_descend_thrust")), 0.0, 1.0)
         self.hc_forward_seconds = float(g("hard_code_forward_seconds"))
-        self.hc_forward_downthrust = clamp(float(g("hard_code_forward_downthrust")), 0.0, 1.0)
         self._fake_until = None   # lazily set on first gate check, not at startup
 
         # INS state. Under sim_sensors these are seeded live (not None/0)
@@ -415,11 +412,11 @@ class Qualify(Node):
             self._log("warn", "DRY RUN: no arm, no thrust published.")
         if self.hard_code and self.hc_open_loop:
             self._log("warn",
-                f"HARD_CODE OPEN-LOOP: no vision, NO DVL/altimeter/INS, NO baro/ALT_HOLD -- "
-                f"pure timed thrust in STABILIZE the whole run. Down-thrust "
-                f"{self.hc_descend_thrust:.2f} for {self.hc_descend_seconds:.1f}s, then forward "
-                f"for {self.hc_forward_seconds:.1f}s (down-hold {self.hc_forward_downthrust:.2f}), "
-                f"then disarm. Amounts are TIME, not distance. No depth feedback of any kind.")
+                f"HARD_CODE OPEN-LOOP: no vision, and NO DVL/altimeter/INS-position -- "
+                f"timed thrust only. Down-thrust {self.hc_descend_thrust:.2f} for "
+                f"{self.hc_descend_seconds:.1f}s, then ALT_HOLD holds depth, then forward "
+                f"for {self.hc_forward_seconds:.1f}s on the captured heading, then disarm. "
+                f"Amounts are TIME (tune in the pool), not distance.")
         elif self.hard_code:
             self._log("warn",
                 f"HARD_CODE MODE: no vision, no gate. Descend "
@@ -1162,24 +1159,17 @@ class Qualify(Node):
     def hard_code_forward_timed(self):
         """OPEN-LOOP forward (hard_code_open_loop): drive forward at cruise for
         a fixed time in STABILIZE, holding heading, with NO position feedback
-        and NO baro/ALT_HOLD. If hard_code_forward_downthrust > 0, also command
-        that much down-thrust the WHOLE time to counteract buoyancy and stay
-        near the dived depth -- open-loop, since there is no depth sensor in the
-        loop. 0.0 = pure forward (z neutral; the vehicle will drift in depth per
-        its buoyancy)."""
+        and NO baro/ALT_HOLD. z stays neutral -- no depth loop, no depth sensor
+        of any kind. Time, not distance: tune hard_code_forward_seconds."""
         self.enter("HARD_CODE_FORWARD")
-        z = clamp(Z_NEUTRAL - self.altitude_sign * self.hc_forward_downthrust * 500.0,
-                  0.0, 1000.0)
         self._log("info",
             f"OPEN-LOOP forward: cruise for {self.hc_forward_seconds:.1f}s on heading "
-            f"{self.gate_heading:.1f}, z={z:.0f} (down-hold {self.hc_forward_downthrust:.2f}) "
-            f"-- STABILIZE, NO baro/ALT_HOLD, NO position feedback.")
+            f"{self.gate_heading:.1f} -- STABILIZE, NO baro/ALT_HOLD, NO position feedback.")
         t_end = time.time() + self.hc_forward_seconds
         while time.time() < t_end:
             self.log_every("hc_forward_timed", 1.0, lambda: (
-                f"  forward open-loop  {t_end - time.time():.1f}s left  z {z:.0f}  "
-                f"hdg {self.heading:.1f}"))
-            self.tick(self.cruise_v, self.yaw_to(self.gate_heading), z=z)
+                f"  forward open-loop  {t_end - time.time():.1f}s left  hdg {self.heading:.1f}"))
+            self.tick(self.cruise_v, self.yaw_to(self.gate_heading), z=Z_NEUTRAL)
         self._log("info", "OPEN-LOOP forward done.")
 
     def _prepare_hard_code_descent(self):
