@@ -297,8 +297,6 @@ class Qualify(Node):
         d("hard_code_descend_seconds", HARD_CODE_DESCEND_SECONDS)   # open-loop: s of down-thrust
         d("hard_code_descend_thrust", HARD_CODE_DESCEND_THRUST)     # open-loop: down-thrust fraction 0-1
         d("hard_code_forward_seconds", HARD_CODE_FORWARD_SECONDS)   # open-loop: s of forward-thrust
-        d("hard_code_forward_downthrust", 0.6)   # down-thrust (0-1) held DURING forward so the AUV
-                                                 # stays underwater. altitude_sign sets direction.
 
         g = lambda n: self.get_parameter(n).value
         self.dry_run = bool(g("dry_run"))
@@ -335,7 +333,6 @@ class Qualify(Node):
         self.hc_descend_seconds = float(g("hard_code_descend_seconds"))
         self.hc_descend_thrust = clamp(float(g("hard_code_descend_thrust")), 0.0, 1.0)
         self.hc_forward_seconds = float(g("hard_code_forward_seconds"))
-        self.hc_forward_downthrust = clamp(float(g("hard_code_forward_downthrust")), 0.0, 1.0)
         self._fake_until = None   # lazily set on first gate check, not at startup
 
         # INS state. Under sim_sensors these are seeded live (not None/0)
@@ -919,8 +916,9 @@ class Qualify(Node):
 
         try:
             if self.hard_code and self.hc_open_loop:
-                self.hard_code_descend_timed()      # timed down-thrust, STABILIZE, no baro
-                self.hard_code_forward_timed()      # timed forward-thrust, STABILIZE, no baro
+                self.hard_code_descend_timed()      # timed down-thrust, no altimeter
+                self.settle()
+                self.hard_code_forward_timed()      # timed forward-thrust, no INS position
             elif self.hard_code:
                 self._prepare_hard_code_descent()   # sets target_altitude_m from launch alt
                 self.seek_altitude()                # same descent loop + safety as vision path
@@ -1134,22 +1132,24 @@ class Qualify(Node):
 
     def hard_code_descend_timed(self):
         """OPEN-LOOP descent (hard_code_open_loop): command down-thrust for a
-        fixed time in STABILIZE -- NO barometer/ALT_HOLD, NO altimeter, pure
-        timed thrust. Which way is "down" obeys altitude_sign (if the vehicle
-        RISES, flip it). Keep the time short: the only thing stopping the
-        descent is the clock, there is no depth feedback of any kind.
+        fixed time, IGNORING the altimeter entirely -- for when the
+        DVL/altimeter can't be trusted. Holds heading throughout. Which way
+        is "down" obeys altitude_sign (if the vehicle RISES, flip it). After
+        the timed push it hands off to ALT_HOLD so the Cube's OWN barometer
+        -- a different sensor from the DVL, unaffected by the DVL being bad --
+        holds the reached depth for the forward run. Keep the time short: the
+        only thing stopping the descent is the clock, there is no altimeter
+        safety floor here.
 
-        Stays in STABILIZE (set in run() before this) the whole run -- z is a
-        direct thruster command. We deliberately do NOT switch to ALT_HOLD,
-        because ALT_HOLD closes a depth loop on the barometer and if that
-        reading is junk it fights the pilot commands.
+        Runs in STABILIZE (set in run() before this), which gives z a direct
+        thruster response; ALT_HOLD's rate-limited z would be too gentle.
         """
         self.enter("HARD_CODE_DESCEND")
         z = clamp(Z_NEUTRAL - self.altitude_sign * self.hc_descend_thrust * 500.0,
                   0.0, 1000.0)
         self._log("warn",
             f"OPEN-LOOP descend: z={z:.0f} (delta {z - Z_NEUTRAL:+.0f}) for "
-            f"{self.hc_descend_seconds:.1f}s in STABILIZE -- NO baro/ALT_HOLD, NO altimeter. "
+            f"{self.hc_descend_seconds:.1f}s -- NO altimeter feedback. "
             f"If the vehicle RISES instead, flip altitude_sign.")
         t_end = time.time() + self.hc_descend_seconds
         while time.time() < t_end:
@@ -1157,28 +1157,26 @@ class Qualify(Node):
                 f"  descending open-loop  z {z:.0f}  {t_end - time.time():.1f}s left  "
                 f"hdg {self.heading:.1f}"))
             self.tick(0.0, self.yaw_to(self.gate_heading), z=z)
-        self._log("info", "OPEN-LOOP descend done (staying in STABILIZE, no depth hold).")
+        # Hand the reached depth to ALT_HOLD (barometer-based, DVL-independent).
+        self.publish(0.0, self.yaw_to(self.gate_heading), z=Z_NEUTRAL)
+        if not self.set_mode("ALT_HOLD"):
+            raise Abort("could not switch to ALT_HOLD after open-loop descent")
+        self._log("info", "OPEN-LOOP descend done. ALT_HOLD (barometer) now holding depth.")
 
     def hard_code_forward_timed(self):
-        """OPEN-LOOP forward (hard_code_open_loop): drive forward at cruise for
-        a fixed time in STABILIZE, holding heading, with NO position feedback
-        and NO baro/ALT_HOLD. Also holds hard_code_forward_downthrust down-thrust
-        the WHOLE time (open-loop, no depth sensor) so the AUV stays underwater
-        for the drive. Direction of "down" obeys altitude_sign. Time, not
-        distance: tune hard_code_forward_seconds."""
+        """OPEN-LOOP forward (hard_code_open_loop): drive forward at cruise
+        for a fixed time, holding heading, with NO position feedback -- for
+        when INS position (DVL dead-reckoning) can't be trusted. Time, not
+        distance: tune hard_code_forward_seconds in the pool."""
         self.enter("HARD_CODE_FORWARD")
-        z = clamp(Z_NEUTRAL - self.altitude_sign * self.hc_forward_downthrust * 500.0,
-                  0.0, 1000.0)
         self._log("info",
             f"OPEN-LOOP forward: cruise for {self.hc_forward_seconds:.1f}s on heading "
-            f"{self.gate_heading:.1f}, holding z={z:.0f} (down-thrust {self.hc_forward_downthrust:.2f}) "
-            f"-- STABILIZE, NO baro/ALT_HOLD, NO position feedback.")
+            f"{self.gate_heading:.1f} -- NO position feedback.")
         t_end = time.time() + self.hc_forward_seconds
         while time.time() < t_end:
             self.log_every("hc_forward_timed", 1.0, lambda: (
-                f"  forward open-loop  {t_end - time.time():.1f}s left  z {z:.0f}  "
-                f"hdg {self.heading:.1f}"))
-            self.tick(self.cruise_v, self.yaw_to(self.gate_heading), z=z)
+                f"  forward open-loop  {t_end - time.time():.1f}s left  hdg {self.heading:.1f}"))
+            self.tick(self.cruise_v, self.yaw_to(self.gate_heading), z=Z_NEUTRAL)
         self._log("info", "OPEN-LOOP forward done.")
 
     def _prepare_hard_code_descent(self):
