@@ -225,13 +225,14 @@ HARD_CODE_DESCEND_THRUST = 0.4          # fraction of full z authority (0-1); 0.
 HARD_CODE_FORWARD_SECONDS = 8.0         # s to command forward-thrust through the gate
 
 # OPEN-LOOP SCRIPTED SEQUENCE (hard_code_sequence). A space-separated list of
-# single-axis steps "axis:seconds:thrust" run back-to-back with NO gap, all in
-# STABILIZE -- so a positively-buoyant sub never gets a chance to resurface
-# between steps. axis is "down" (vertical, direction=altitude_sign) or "fwd"
-# (forward). thrust is 0-1. Empty string -> fall back to the single
-# descend-then-forward path. This is the primary hard-code path now.
-HARD_CODE_SEQUENCE = ("down:6:0.75 fwd:3:0.5 down:3:0.6 fwd:3:0.5 "
-                      "down:3:0.6 fwd:3:0.5 down:3:0.6 fwd:3:0.5")
+# timed steps run back-to-back with NO gap, all in STABILIZE -- so a
+# positively-buoyant sub never gets a chance to resurface between steps.
+#   down:S:T      -> down-thrust T only (dir=altitude_sign) for S s
+#   fwd:S:T       -> forward-thrust T only for S s
+#   both:S:Td:Tf  -> down-thrust Td AND forward-thrust Tf at the same time
+# thrust 0-1. Empty string -> fall back to single descend-then-forward.
+# Default: dive first to get under, then drive forward WHILE holding down.
+HARD_CODE_SEQUENCE = "down:6:0.75 both:12:0.6:0.5"
 
 # Fixed tuning constants. These get set once from pool testing and rarely
 # change between runs -- edit them here rather than adding another ROS
@@ -1145,51 +1146,50 @@ class Qualify(Node):
             self.tick(0.0, self.yaw_to(self.gate_heading), z=z)
 
     def hard_code_sequence_run(self):
-        """OPEN-LOOP scripted sequence (hard_code_sequence): run a list of
-        single-axis timed steps back-to-back with NO gap and NO mode change
-        between them -- the whole thing runs in STABILIZE (set in run() before
-        this), so a positively-buoyant sub never gets a still moment to
-        resurface. NO baro/ALT_HOLD, NO depth sensor of any kind.
+        """OPEN-LOOP scripted sequence (hard_code_sequence): run a list of timed
+        steps back-to-back with NO gap and NO mode change between them -- the
+        whole thing runs in STABILIZE (set in run() before this), so a
+        positively-buoyant sub never gets a still moment to resurface. NO
+        baro/ALT_HOLD, NO depth sensor of any kind.
 
-        Each step is "axis:seconds:thrust":
-          down:S:T -> vertical thrust T (direction = altitude_sign) for S s
-          fwd:S:T  -> forward thrust T for S s
-        thrust is 0-1 (fraction of full authority).
+        Each step (space-separated), thrust values 0-1:
+          down:S:T        -> down-thrust T only, for S s (dir = altitude_sign)
+          fwd:S:T         -> forward-thrust T only, for S s
+          both:S:Td:Tf    -> down-thrust Td AND forward-thrust Tf AT THE SAME
+                             TIME, for S s (dive while driving)
         """
         self.enter("HARD_CODE_SEQUENCE")
+        # Every step normalized to (name, seconds, down_thrust, fwd_thrust).
         steps = []
         for tok in self.hc_sequence.split():
             p = tok.split(":")
-            if len(p) != 3:
-                self._log("warn", f"skip bad step '{tok}' (need axis:seconds:thrust)")
-                continue
+            a = p[0].lower()
             try:
-                secs = float(p[1])
-                thr = clamp(float(p[2]), 0.0, 1.0)
-            except ValueError:
-                self._log("warn", f"skip bad step '{tok}' (non-numeric seconds/thrust)")
-                continue
-            steps.append((p[0].lower(), secs, thr))
+                if a in ("down", "dn", "d"):
+                    steps.append((a, float(p[1]), clamp(float(p[2]), 0.0, 1.0), 0.0))
+                elif a in ("fwd", "forward", "fw", "f"):
+                    steps.append((a, float(p[1]), 0.0, clamp(float(p[2]), 0.0, 1.0)))
+                elif a in ("both", "dive", "drive", "df"):
+                    steps.append((a, float(p[1]), clamp(float(p[2]), 0.0, 1.0),
+                                  clamp(float(p[3]), 0.0, 1.0)))
+                else:
+                    self._log("warn", f"skip step '{tok}' (axis must be down/fwd/both)")
+            except (IndexError, ValueError):
+                self._log("warn",
+                    f"skip bad step '{tok}' (need down/fwd:seconds:thrust or both:seconds:down:fwd)")
         if not steps:
             raise Abort("hard_code_sequence has no valid steps")
 
         self._log("warn",
             f"OPEN-LOOP SEQUENCE: {len(steps)} steps, STABILIZE, NO baro, NO gaps -- "
-            + "  ".join(f"{a}:{s:.0f}s@{t:.2f}" for a, s, t in steps))
+            + "  ".join(f"{a}:{s:.0f}s(dn{dn:.2f}/fw{fw:.2f})" for a, s, dn, fw in steps))
 
-        for i, (axis, secs, thr) in enumerate(steps, 1):
-            if axis in ("down", "dn", "d"):
-                z = clamp(Z_NEUTRAL - self.altitude_sign * thr * 500.0, 0.0, 1000.0)
-                x = 0.0
-                label = f"DOWN z={z:.0f}"
-            elif axis in ("fwd", "forward", "fw", "f"):
-                z = Z_NEUTRAL
-                x = thr * 1000.0
-                label = f"FWD x={x:.0f}"
-            else:
-                self._log("warn", f"unknown axis '{axis}' -- neutral hold for this step")
-                z, x, label = Z_NEUTRAL, 0.0, "HOLD"
-            self._log("info", f"  step {i}/{len(steps)}: {axis} {secs:.1f}s @ {thr:.2f}  ({label})")
+        for i, (a, secs, dn, fw) in enumerate(steps, 1):
+            z = clamp(Z_NEUTRAL - self.altitude_sign * dn * 500.0, 0.0, 1000.0)
+            x = fw * 1000.0
+            label = f"z={z:.0f} x={x:.0f}"
+            self._log("info",
+                f"  step {i}/{len(steps)}: {a} {secs:.1f}s  down {dn:.2f} / fwd {fw:.2f}  ({label})")
             t_end = time.time() + secs
             while time.time() < t_end:
                 self.log_every("hc_seq", 1.0, (lambda i=i, label=label, t_end=t_end: (
