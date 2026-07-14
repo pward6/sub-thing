@@ -1146,56 +1146,193 @@ class Qualify(Node):
             self.tick(0.0, self.yaw_to(self.gate_heading), z=z)
 
     def hard_code_sequence_run(self):
-        """OPEN-LOOP scripted sequence (hard_code_sequence): run a list of timed
-        steps back-to-back with NO gap and NO mode change between them -- the
-        whole thing runs in STABILIZE (set in run() before this), so a
-        positively-buoyant sub never gets a still moment to resurface. NO
-        baro/ALT_HOLD, NO depth sensor of any kind.
+    """
+    OPEN-LOOP scripted sequence using hard_code_sequence.
 
-        Each step (space-separated), thrust values 0-1:
-          down:S:T        -> down-thrust T only, for S s (dir = altitude_sign)
-          fwd:S:T         -> forward-thrust T only, for S s
-          both:S:Td:Tf    -> down-thrust Td AND forward-thrust Tf AT THE SAME
-                             TIME, for S s (dive while driving)
-        """
-        self.enter("HARD_CODE_SEQUENCE")
-        # Every step normalized to (name, seconds, down_thrust, fwd_thrust).
-        steps = []
-        for tok in self.hc_sequence.split():
-            p = tok.split(":")
-            a = p[0].lower()
-            try:
-                if a in ("down", "dn", "d"):
-                    steps.append((a, float(p[1]), clamp(float(p[2]), 0.0, 1.0), 0.0))
-                elif a in ("fwd", "forward", "fw", "f"):
-                    steps.append((a, float(p[1]), 0.0, clamp(float(p[2]), 0.0, 1.0)))
-                elif a in ("both", "dive", "drive", "df"):
-                    steps.append((a, float(p[1]), clamp(float(p[2]), 0.0, 1.0),
-                                  clamp(float(p[3]), 0.0, 1.0)))
-                else:
-                    self._log("warn", f"skip step '{tok}' (axis must be down/fwd/both)")
-            except (IndexError, ValueError):
-                self._log("warn",
-                    f"skip bad step '{tok}' (need down/fwd:seconds:thrust or both:seconds:down:fwd)")
-        if not steps:
-            raise Abort("hard_code_sequence has no valid steps")
+    Commands are space-separated:
 
-        self._log("warn",
-            f"OPEN-LOOP SEQUENCE: {len(steps)} steps, STABILIZE, NO baro, NO gaps -- "
-            + "  ".join(f"{a}:{s:.0f}s(dn{dn:.2f}/fw{fw:.2f})" for a, s, dn, fw in steps))
+    down:S:T
+        Run the down thrusters at thrust T for S seconds.
 
-        for i, (a, secs, dn, fw) in enumerate(steps, 1):
-            z = clamp(Z_NEUTRAL - self.altitude_sign * dn * 500.0, 0.0, 1000.0)
-            x = fw * 1000.0
-            label = f"z={z:.0f} x={x:.0f}"
-            self._log("info",
-                f"  step {i}/{len(steps)}: {a} {secs:.1f}s  down {dn:.2f} / fwd {fw:.2f}  ({label})")
-            t_end = time.time() + secs
-            while time.time() < t_end:
-                self.log_every("hc_seq", 1.0, (lambda i=i, label=label, t_end=t_end: (
-                    f"    step {i}/{len(steps)} {label}  {t_end - time.time():.1f}s left")))
-                self.tick(x, self.yaw_to(self.gate_heading), z=z)   # no sleep/settle between steps
-        self._log("info", "OPEN-LOOP SEQUENCE done.")
+    fwd:S:T
+        Run the forward thrusters at thrust T for S seconds.
+
+    both:S:Td:Tf
+        Run down thrust Td and forward thrust Tf simultaneously
+        for S seconds.
+
+    stop:S
+        Run the down thrusters at 0.45 and set forward/yaw thrust
+        to zero for S seconds.
+
+    All commands run in STABILIZE with no gaps between steps.
+    """
+
+    self.enter("HARD_CODE_SEQUENCE")
+
+    # Every step is normalized to:
+    # (command_name, seconds, down_thrust, forward_thrust)
+    steps = []
+
+    for tok in self.hc_sequence.split():
+        p = tok.split(":")
+        command = p[0].lower()
+
+        try:
+            if command in ("down", "dn", "d"):
+                seconds = float(p[1])
+                down_thrust = clamp(float(p[2]), 0.0, 1.0)
+
+                steps.append(
+                    (command, seconds, down_thrust, 0.0)
+                )
+
+            elif command in ("fwd", "forward", "fw", "f"):
+                seconds = float(p[1])
+                forward_thrust = clamp(float(p[2]), 0.0, 1.0)
+
+                steps.append(
+                    (command, seconds, 0.0, forward_thrust)
+                )
+
+            elif command in ("both", "dive", "drive", "df"):
+                seconds = float(p[1])
+                down_thrust = clamp(float(p[2]), 0.0, 1.0)
+                forward_thrust = clamp(float(p[3]), 0.0, 1.0)
+
+                steps.append(
+                    (
+                        command,
+                        seconds,
+                        down_thrust,
+                        forward_thrust,
+                    )
+                )
+
+            elif command in ("stop", "hold"):
+                seconds = float(p[1])
+
+                # Fixed hover command:
+                # down thrusters = 0.45
+                # forward thrusters = 0.0
+                steps.append(
+                    (command, seconds, 0.45, 0.0)
+                )
+
+            else:
+                self._log(
+                    "warn",
+                    (
+                        f"skip step '{tok}' "
+                        "(command must be down/fwd/both/stop)"
+                    ),
+                )
+
+        except (IndexError, ValueError):
+            self._log(
+                "warn",
+                (
+                    f"skip bad step '{tok}'. Expected: "
+                    "down:seconds:thrust, "
+                    "fwd:seconds:thrust, "
+                    "both:seconds:down:fwd, or "
+                    "stop:seconds"
+                ),
+            )
+
+    if not steps:
+        raise Abort("hard_code_sequence has no valid steps")
+
+    self._log(
+        "warn",
+        (
+            f"OPEN-LOOP SEQUENCE: {len(steps)} steps, "
+            "STABILIZE, NO baro, NO gaps -- "
+            + " ".join(
+                (
+                    f"{command}:{seconds:.0f}s"
+                    f"(dn{down_thrust:.2f}/"
+                    f"fw{forward_thrust:.2f})"
+                )
+                for (
+                    command,
+                    seconds,
+                    down_thrust,
+                    forward_thrust,
+                ) in steps
+            )
+        ),
+    )
+
+    for i, (
+        command,
+        seconds,
+        down_thrust,
+        forward_thrust,
+    ) in enumerate(steps, 1):
+
+        # Convert normalized thrust fractions to MAVROS controls.
+        z = clamp(
+            Z_NEUTRAL
+            - self.altitude_sign * down_thrust * 500.0,
+            0.0,
+            1000.0,
+        )
+
+        x = forward_thrust * 1000.0
+
+        # A stop command must also disable yaw correction.
+        # Otherwise, a nonzero r command could still actuate the
+        # forward thrusters differentially.
+        if command in ("stop", "hold"):
+            yaw_command = 0.0
+        else:
+            yaw_command = self.yaw_to(self.gate_heading)
+
+        label = (
+            f"x={x:.0f} z={z:.0f} r={yaw_command:.0f}"
+        )
+
+        self._log(
+            "info",
+            (
+                f" step {i}/{len(steps)}: "
+                f"{command} {seconds:.1f}s "
+                f"down {down_thrust:.2f} / "
+                f"fwd {forward_thrust:.2f} "
+                f"({label})"
+            ),
+        )
+
+        end_time = time.time() + seconds
+
+        while time.time() < end_time:
+            self.log_every(
+                "hc_seq",
+                1.0,
+                (
+                    lambda i=i,
+                    label=label,
+                    end_time=end_time: (
+                        f" step {i}/{len(steps)} "
+                        f"{label} "
+                        f"{end_time - time.time():.1f}s left"
+                    )
+                ),
+            )
+
+            self.tick(
+                x,
+                yaw_command,
+                z=z,
+            )
+
+        # No delay or neutral command between sequence steps.
+
+    self._log(
+        "info",
+        "OPEN-LOOP SEQUENCE done.",
+    )
 
     def hard_code_descend_timed(self):
         """OPEN-LOOP descent (hard_code_open_loop): command down-thrust for a
