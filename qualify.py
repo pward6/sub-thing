@@ -297,6 +297,8 @@ class Qualify(Node):
         d("hard_code_descend_seconds", HARD_CODE_DESCEND_SECONDS)   # open-loop: s of down-thrust
         d("hard_code_descend_thrust", HARD_CODE_DESCEND_THRUST)     # open-loop: down-thrust fraction 0-1
         d("hard_code_forward_seconds", HARD_CODE_FORWARD_SECONDS)   # open-loop: s of forward-thrust
+        d("hard_code_forward_downthrust", 0.6)   # down-thrust (0-1) held DURING forward so the AUV
+                                                 # stays underwater. altitude_sign sets direction.
 
         g = lambda n: self.get_parameter(n).value
         self.dry_run = bool(g("dry_run"))
@@ -333,6 +335,7 @@ class Qualify(Node):
         self.hc_descend_seconds = float(g("hard_code_descend_seconds"))
         self.hc_descend_thrust = clamp(float(g("hard_code_descend_thrust")), 0.0, 1.0)
         self.hc_forward_seconds = float(g("hard_code_forward_seconds"))
+        self.hc_forward_downthrust = clamp(float(g("hard_code_forward_downthrust")), 0.0, 1.0)
         self._fake_until = None   # lazily set on first gate check, not at startup
 
         # INS state. Under sim_sensors these are seeded live (not None/0)
@@ -1159,17 +1162,23 @@ class Qualify(Node):
     def hard_code_forward_timed(self):
         """OPEN-LOOP forward (hard_code_open_loop): drive forward at cruise for
         a fixed time in STABILIZE, holding heading, with NO position feedback
-        and NO baro/ALT_HOLD. z stays neutral -- no depth loop, no depth sensor
-        of any kind. Time, not distance: tune hard_code_forward_seconds."""
+        and NO baro/ALT_HOLD. Also holds hard_code_forward_downthrust down-thrust
+        the WHOLE time (open-loop, no depth sensor) so the AUV stays underwater
+        for the drive. Direction of "down" obeys altitude_sign. Time, not
+        distance: tune hard_code_forward_seconds."""
         self.enter("HARD_CODE_FORWARD")
+        z = clamp(Z_NEUTRAL - self.altitude_sign * self.hc_forward_downthrust * 500.0,
+                  0.0, 1000.0)
         self._log("info",
             f"OPEN-LOOP forward: cruise for {self.hc_forward_seconds:.1f}s on heading "
-            f"{self.gate_heading:.1f} -- STABILIZE, NO baro/ALT_HOLD, NO position feedback.")
+            f"{self.gate_heading:.1f}, holding z={z:.0f} (down-thrust {self.hc_forward_downthrust:.2f}) "
+            f"-- STABILIZE, NO baro/ALT_HOLD, NO position feedback.")
         t_end = time.time() + self.hc_forward_seconds
         while time.time() < t_end:
             self.log_every("hc_forward_timed", 1.0, lambda: (
-                f"  forward open-loop  {t_end - time.time():.1f}s left  hdg {self.heading:.1f}"))
-            self.tick(self.cruise_v, self.yaw_to(self.gate_heading), z=Z_NEUTRAL)
+                f"  forward open-loop  {t_end - time.time():.1f}s left  z {z:.0f}  "
+                f"hdg {self.heading:.1f}"))
+            self.tick(self.cruise_v, self.yaw_to(self.gate_heading), z=z)
         self._log("info", "OPEN-LOOP forward done.")
 
     def _prepare_hard_code_descent(self):
