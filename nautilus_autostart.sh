@@ -79,14 +79,15 @@ echo "[autostart] Cube CONNECTED (connected:true). Settling 5s, then launching m
 sleep 5
 
 # ---- MISSION PARAMS (tune here) ----
+# hard_code_sequence: scripted "axis:seconds:thrust" steps run back-to-back
+# with NO gap, all in STABILIZE (no baro). axis = down (dir=altitude_sign) or
+# fwd. thrust 0-1. altitude_sign:=1.0 = down (flip to -1.0 if down steps rise).
 python3 scripts/qualify.py --ros-args \
   -p hard_code_enable:=true \
   -p hard_code_open_loop:=true \
   -p no_nucleus:=true \
-  -p hard_code_descend_seconds:=7.0 \
-  -p hard_code_descend_thrust:=0.4 \
-  -p hard_code_forward_seconds:=8.0 \
-  -p altitude_sign:=-1.0 \
+  -p hard_code_sequence:="down:6:0.75 fwd:3:0.5 down:3:0.6 fwd:3:0.5 down:3:0.6 fwd:3:0.5 down:3:0.6 fwd:3:0.5" \
+  -p altitude_sign:=1.0 \
   -p arm_delay:=5.0
 
 echo "[autostart] mission finished. Tearing down stack."
