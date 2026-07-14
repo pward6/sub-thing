@@ -436,6 +436,23 @@ class Qualify(Node):
                 f"{self.hard_down_m / FT_TO_M:.1f}ft ({self.hard_down_m:.2f}m) below launch "
                 f"altitude, then drive forward {self.hard_forward_m / FT_TO_M:.1f}ft "
                 f"({self.hard_forward_m:.2f}m) on the captured heading, then disarm.")
+        # altitude_sign is the one number in an open-loop run that nothing can
+        # check: there is no altimeter floor in this mode, no baro, and every
+        # step is timed, so a backwards sign just drives the vehicle the wrong
+        # way for the full sequence with only the kill switch to stop it. The
+        # module constant (VERIFIED on the vehicle) and nautilus_autostart.sh
+        # currently disagree about which way is down -- say so, loudly, rather
+        # than let whichever one happened to win go unnoticed.
+        if self.hard_code and self.hc_open_loop and self.altitude_sign != ALTITUDE_SIGN:
+            down_z = clamp(Z_NEUTRAL - self.altitude_sign * 500.0, 0.0, 1000.0)
+            self._log("warn",
+                f"*** altitude_sign={self.altitude_sign:+.1f} OVERRIDES the value verified "
+                f"on this vehicle (ALTITUDE_SIGN={ALTITUDE_SIGN:+.1f}). A 'down' step will "
+                f"command z toward {down_z:.0f} (neutral {Z_NEUTRAL:.0f}); by the verified "
+                f"constant that is UP, not down. Open-loop has NO altimeter floor and NO "
+                f"baro -- nothing will catch this. WATCH THE FIRST DIVE, hand on the kill "
+                f"switch: if the vehicle RISES, flip altitude_sign. ***")
+
         if self.sim_sensors:
             self._log("warn",
                 "SIM_SENSORS: FCU/INS/altimeter are all synthetic, integrated from "
@@ -1175,274 +1192,285 @@ class Qualify(Node):
         All commands run in STABILIZE with no gaps between steps.
         """
 
-    self.enter("HARD_CODE_SEQUENCE")
+        self.enter("HARD_CODE_SEQUENCE")
 
-    # Every step is normalized to:
-    # (
-    #     command_name,
-    #     seconds,
-    #     down_thrust,
-    #     forward_thrust,
-    #     turn_yaw_thrust,
-    # )
-    #
-    # turn_yaw_thrust is signed:
-    # negative = left
-    # positive = right
-    steps = []
+        # Every step is normalized to:
+        # (
+        #     command_name,
+        #     seconds,
+        #     down_thrust,
+        #     forward_thrust,
+        #     turn_yaw_thrust,
+        # )
+        #
+        # turn_yaw_thrust is signed:
+        # negative = left
+        # positive = right
+        steps = []
 
-    for tok in self.hc_sequence.split():
-        p = tok.split(":")
-        command = p[0].lower()
+        for tok in self.hc_sequence.split():
+            p = tok.split(":")
+            command = p[0].lower()
 
-        try:
-            if command in ("down", "dn", "d"):
-                seconds = float(p[1])
-                down_thrust = clamp(
-                    float(p[2]),
-                    0.0,
-                    1.0,
+            try:
+                if command in ("down", "dn", "d"):
+                    seconds = float(p[1])
+                    down_thrust = clamp(
+                        float(p[2]),
+                        0.0,
+                        1.0,
+                    )
+
+                    steps.append(
+                        (
+                            command,
+                            seconds,
+                            down_thrust,
+                            0.0,
+                            0.0,
+                        )
+                    )
+
+                elif command in ("fwd", "forward", "fw", "f"):
+                    seconds = float(p[1])
+                    forward_thrust = clamp(
+                        float(p[2]),
+                        0.0,
+                        1.0,
+                    )
+
+                    steps.append(
+                        (
+                            command,
+                            seconds,
+                            0.0,
+                            forward_thrust,
+                            0.0,
+                        )
+                    )
+
+                elif command in ("both", "dive", "drive", "df"):
+                    seconds = float(p[1])
+
+                    down_thrust = clamp(
+                        float(p[2]),
+                        0.0,
+                        1.0,
+                    )
+
+                    forward_thrust = clamp(
+                        float(p[3]),
+                        0.0,
+                        1.0,
+                    )
+
+                    steps.append(
+                        (
+                            command,
+                            seconds,
+                            down_thrust,
+                            forward_thrust,
+                            0.0,
+                        )
+                    )
+
+                elif command in ("stop", "hold"):
+                    seconds = float(p[1])
+
+                    # Hover command:
+                    # down thrust = 0.45
+                    # forward thrust = 0
+                    # yaw thrust = 0
+                    steps.append(
+                        (
+                            command,
+                            seconds,
+                            0.45,
+                            0.0,
+                            0.0,
+                        )
+                    )
+
+                elif command in (
+                    "turn",
+                    "turnleft",
+                    "left",
+                    "uturn",
+                ):
+                    seconds = float(p[1])
+
+                    yaw_thrust = clamp(
+                        float(p[2]),
+                        0.0,
+                        1.0,
+                    )
+
+                    # Hold depth using the same thrust as stop,
+                    # apply no forward thrust, and yaw left.
+                    #
+                    # Negative r is being used as the left-yaw command.
+                    steps.append(
+                        (
+                            command,
+                            seconds,
+                            0.45,
+                            0.0,
+                            -yaw_thrust,
+                        )
+                    )
+
+                else:
+                    self._log(
+                        "warn",
+                        (
+                            f"skip step '{tok}' "
+                            "(command must be "
+                            "down/fwd/both/stop/turn)"
+                        ),
+                    )
+
+            except (IndexError, ValueError):
+                self._log(
+                    "warn",
+                    (
+                        f"skip bad step '{tok}'. Expected: "
+                        "down:seconds:thrust, "
+                        "fwd:seconds:thrust, "
+                        "both:seconds:down:fwd, "
+                        "stop:seconds, or "
+                        "turn:seconds:yaw_thrust"
+                    ),
                 )
 
-                steps.append(
+        if not steps:
+            raise Abort(
+                "hard_code_sequence has no valid steps"
+            )
+
+        self._log(
+            "warn",
+            (
+                f"OPEN-LOOP SEQUENCE: {len(steps)} steps, "
+                "STABILIZE, NO baro, NO gaps -- "
+                + " ".join(
                     (
+                        f"{command}:{seconds:.0f}s"
+                        f"(dn{down_thrust:.2f}/"
+                        f"fw{forward_thrust:.2f}/"
+                        f"yaw{turn_yaw_thrust:.2f})"
+                    )
+                    for (
                         command,
                         seconds,
                         down_thrust,
-                        0.0,
-                        0.0,
-                    )
-                )
-
-            elif command in ("fwd", "forward", "fw", "f"):
-                seconds = float(p[1])
-                forward_thrust = clamp(
-                    float(p[2]),
-                    0.0,
-                    1.0,
-                )
-
-                steps.append(
-                    (
-                        command,
-                        seconds,
-                        0.0,
                         forward_thrust,
-                        0.0,
-                    )
+                        turn_yaw_thrust,
+                    ) in steps
                 )
+            ),
+        )
 
-            elif command in ("both", "dive", "drive", "df"):
-                seconds = float(p[1])
+        for i, (
+            command,
+            seconds,
+            down_thrust,
+            forward_thrust,
+            turn_yaw_thrust,
+        ) in enumerate(steps, 1):
 
-                down_thrust = clamp(
-                    float(p[2]),
-                    0.0,
-                    1.0,
-                )
+            # Convert down-thrust fraction into the MAVROS z command.
+            z = clamp(
+                Z_NEUTRAL
+                - self.altitude_sign
+                * down_thrust
+                * 500.0,
+                0.0,
+                1000.0,
+            )
 
-                forward_thrust = clamp(
-                    float(p[3]),
-                    0.0,
-                    1.0,
-                )
+            # Convert forward-thrust fraction into the MAVROS x command.
+            x = forward_thrust * 1000.0
 
-                steps.append(
-                    (
-                        command,
-                        seconds,
-                        down_thrust,
-                        forward_thrust,
-                        0.0,
-                    )
-                )
-
-            elif command in ("stop", "hold"):
-                seconds = float(p[1])
-
-                # Hover command:
-                # down thrust = 0.45
-                # forward thrust = 0
-                # yaw thrust = 0
-                steps.append(
-                    (
-                        command,
-                        seconds,
-                        0.45,
-                        0.0,
-                        0.0,
-                    )
-                )
-
-            elif command in (
+            # turn/stop command yaw OPEN-LOOP (a fixed r for the whole step);
+            # everything else holds gate_heading, which means yaw_to() has to
+            # be re-evaluated every tick inside the loop below -- a single
+            # correction computed once here would freeze the PI loop for the
+            # entire step and hold a stale demand instead of tracking.
+            if command in (
                 "turn",
                 "turnleft",
                 "left",
                 "uturn",
             ):
-                seconds = float(p[1])
+                # Direct open-loop left-yaw command.
+                fixed_yaw = turn_yaw_thrust * 1000.0
 
-                yaw_thrust = clamp(
-                    float(p[2]),
-                    0.0,
-                    1.0,
-                )
-
-                # Hold depth using the same thrust as stop,
-                # apply no forward thrust, and yaw left.
-                #
-                # Negative r is being used as the left-yaw command.
-                steps.append(
-                    (
-                        command,
-                        seconds,
-                        0.45,
-                        0.0,
-                        -yaw_thrust,
-                    )
-                )
+            elif command in ("stop", "hold"):
+                # Do not allow heading correction to actuate the
+                # forward thrusters during stop.
+                fixed_yaw = 0.0
 
             else:
-                self._log(
-                    "warn",
+                fixed_yaw = None   # -> heading hold, recomputed per tick
+
+            # A turn slews the vehicle deliberately; the heading error it
+            # builds up is not disturbance to be integrated away on the next
+            # heading-hold step.
+            self.reset_pi()
+
+            label = (
+                f"x={x:.0f} "
+                f"z={z:.0f} "
+                f"r={'hold' if fixed_yaw is None else f'{fixed_yaw:.0f}'}"
+            )
+
+            self._log(
+                "info",
+                (
+                    f" step {i}/{len(steps)}: "
+                    f"{command} {seconds:.1f}s "
+                    f"down {down_thrust:.2f} / "
+                    f"fwd {forward_thrust:.2f} / "
+                    f"yaw {turn_yaw_thrust:.2f} "
+                    f"({label})"
+                ),
+            )
+
+            end_time = time.time() + seconds
+
+            while time.time() < end_time:
+                self.log_every(
+                    "hc_seq",
+                    1.0,
                     (
-                        f"skip step '{tok}' "
-                        "(command must be "
-                        "down/fwd/both/stop/turn)"
+                        lambda i=i,
+                        label=label,
+                        end_time=end_time: (
+                            f" step {i}/{len(steps)} "
+                            f"{label} "
+                            f"{end_time - time.time():.1f}s left"
+                        )
                     ),
                 )
 
-        except (IndexError, ValueError):
-            self._log(
-                "warn",
-                (
-                    f"skip bad step '{tok}'. Expected: "
-                    "down:seconds:thrust, "
-                    "fwd:seconds:thrust, "
-                    "both:seconds:down:fwd, "
-                    "stop:seconds, or "
-                    "turn:seconds:yaw_thrust"
-                ),
-            )
-
-    if not steps:
-        raise Abort(
-            "hard_code_sequence has no valid steps"
-        )
-
-    self._log(
-        "warn",
-        (
-            f"OPEN-LOOP SEQUENCE: {len(steps)} steps, "
-            "STABILIZE, NO baro, NO gaps -- "
-            + " ".join(
-                (
-                    f"{command}:{seconds:.0f}s"
-                    f"(dn{down_thrust:.2f}/"
-                    f"fw{forward_thrust:.2f}/"
-                    f"yaw{turn_yaw_thrust:.2f})"
+                yaw_command = (
+                    self.yaw_to(self.gate_heading)
+                    if fixed_yaw is None
+                    else fixed_yaw
                 )
-                for (
-                    command,
-                    seconds,
-                    down_thrust,
-                    forward_thrust,
-                    turn_yaw_thrust,
-                ) in steps
-            )
-        ),
-    )
 
-    for i, (
-        command,
-        seconds,
-        down_thrust,
-        forward_thrust,
-        turn_yaw_thrust,
-    ) in enumerate(steps, 1):
+                self.tick(
+                    x,
+                    yaw_command,
+                    z=z,
+                )
 
-        # Convert down-thrust fraction into the MAVROS z command.
-        z = clamp(
-            Z_NEUTRAL
-            - self.altitude_sign
-            * down_thrust
-            * 500.0,
-            0.0,
-            1000.0,
-        )
-
-        # Convert forward-thrust fraction into the MAVROS x command.
-        x = forward_thrust * 1000.0
-
-        if command in (
-            "turn",
-            "turnleft",
-            "left",
-            "uturn",
-        ):
-            # Direct open-loop left-yaw command.
-            yaw_command = (
-                turn_yaw_thrust * 1000.0
-            )
-
-        elif command in ("stop", "hold"):
-            # Do not allow heading correction to actuate the
-            # forward thrusters during stop.
-            yaw_command = 0.0
-
-        else:
-            # Normal heading hold for down/fwd/both.
-            yaw_command = self.yaw_to(
-                self.gate_heading
-            )
-
-        label = (
-            f"x={x:.0f} "
-            f"z={z:.0f} "
-            f"r={yaw_command:.0f}"
-        )
+            # No delay or neutral command between steps.
 
         self._log(
             "info",
-            (
-                f" step {i}/{len(steps)}: "
-                f"{command} {seconds:.1f}s "
-                f"down {down_thrust:.2f} / "
-                f"fwd {forward_thrust:.2f} / "
-                f"yaw {turn_yaw_thrust:.2f} "
-                f"({label})"
-            ),
+            "OPEN-LOOP SEQUENCE done.",
         )
-
-        end_time = time.time() + seconds
-
-        while time.time() < end_time:
-            self.log_every(
-                "hc_seq",
-                1.0,
-                (
-                    lambda i=i,
-                    label=label,
-                    end_time=end_time: (
-                        f" step {i}/{len(steps)} "
-                        f"{label} "
-                        f"{end_time - time.time():.1f}s left"
-                    )
-                ),
-            )
-
-            self.tick(
-                x,
-                yaw_command,
-                z=z,
-            )
-
-        # No delay or neutral command between steps.
-
-    self._log(
-        "info",
-        "OPEN-LOOP SEQUENCE done.",
-    )
 
     def hard_code_descend_timed(self):
         """OPEN-LOOP descent (hard_code_open_loop): command down-thrust for a
