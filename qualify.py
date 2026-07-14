@@ -1146,34 +1146,34 @@ class Qualify(Node):
             self.tick(0.0, self.yaw_to(self.gate_heading), z=z)
 
     def hard_code_sequence_run(self):
-    """
-    OPEN-LOOP scripted sequence using hard_code_sequence.
+        """
+        OPEN-LOOP scripted sequence using hard_code_sequence.
 
-    Commands are space-separated:
+        Commands are space-separated:
 
-    down:S:T
-        Run the down thrusters at thrust T for S seconds.
+        down:S:T
+            Run the down thrusters at thrust T for S seconds.
 
-    fwd:S:T
-        Run the forward thrusters at thrust T for S seconds.
+        fwd:S:T
+            Run the forward thrusters at thrust T for S seconds.
 
-    both:S:Td:Tf
-        Run down thrust Td and forward thrust Tf simultaneously
-        for S seconds.
+        both:S:Td:Tf
+            Run down thrust Td and forward thrust Tf simultaneously
+            for S seconds.
 
-    stop:S
-        Run the down thrusters at 0.45 and set forward/yaw thrust
-        to zero for S seconds.
+        stop:S
+            Run the down thrusters at 0.45 and set forward/yaw thrust
+            to zero for S seconds.
 
-    turn:S:Ty
-        Run the down thrusters at 0.45, set forward thrust to zero,
-        and yaw left at thrust Ty for S seconds.
+        turn:S:Ty
+            Run the down thrusters at 0.45, set forward thrust to zero,
+            and yaw left at thrust Ty for S seconds.
 
-        The turn duration must be tuned in the pool until it produces
-        approximately 180 degrees of rotation.
+            The turn duration must be tuned in the pool until it produces
+            approximately 180 degrees of rotation.
 
-    All commands run in STABILIZE with no gaps between steps.
-    """
+        All commands run in STABILIZE with no gaps between steps.
+        """
 
     self.enter("HARD_CODE_SEQUENCE")
 
