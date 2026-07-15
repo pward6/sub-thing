@@ -85,11 +85,12 @@ sleep 5
 #   fwd:S:T       forward-thrust only
 #   both:S:Td:Tf  down Td AND forward Tf at the SAME time (dive while driving)
 # altitude_sign:=1.0 = down (flip to -1.0 if down steps rise).
+# down:4:0.9 both:10:0.45:0.8 stop:5 turn:7:0.4 down:4:0.9 both:15:0.45:0.8 - Turning
 python3 scripts/qualify.py --ros-args \
   -p hard_code_enable:=true \
   -p hard_code_open_loop:=true \
   -p no_nucleus:=true \
-  -p hard_code_sequence:="down:4:0.9 both:10:0.45:0.8 stop:5 turn:7:0.4 down:4:0.9 both:15:0.45:0.8" \
+  -p hard_code_sequence:="down:4:0.9 both:10:0.45:0.8 barrel_roll:4:0.8:0.85" \
   -p altitude_sign:=1.0 \
   -p arm_delay:=5.0
 
