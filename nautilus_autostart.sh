@@ -89,7 +89,7 @@ python3 scripts/qualify.py --ros-args \
   -p hard_code_enable:=true \
   -p hard_code_open_loop:=true \
   -p no_nucleus:=true \
-  -p hard_code_sequence:="down:4:0.9 both:20:0.45:0.8 stop:5 turn:5:0.4 both:25:0.45:0.8" \
+  -p hard_code_sequence:="down:4:0.9 both:10:0.45:0.8 stop:5 turn:7:0.4 down:4:0.9 both:15:0.45:0.8" \
   -p altitude_sign:=1.0 \
   -p arm_delay:=5.0
 
