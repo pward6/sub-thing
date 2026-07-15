@@ -1164,313 +1164,153 @@ class Qualify(Node):
 
     def hard_code_sequence_run(self):
         """
-        OPEN-LOOP scripted sequence using hard_code_sequence.
+        Run the open-loop hard-coded command sequence.
 
-        Commands are space-separated:
+        Command formats:
 
-        down:S:T
-            Run the down thrusters at thrust T for S seconds.
+            down:SECONDS:THRUST
+            fwd:SECONDS:THRUST
+            both:SECONDS:DOWN_THRUST:FORWARD_THRUST
+            stop:SECONDS
+            turn:SECONDS:YAW_THRUST
+            barrel_roll:SECONDS:FORWARD_THRUST:ROLL_THRUST
 
-        fwd:S:T
-            Run the forward thrusters at thrust T for S seconds.
+        Barrel-roll example:
 
-        both:S:Td:Tf
-            Run down thrust Td and forward thrust Tf simultaneously
-            for S seconds.
+            barrel_roll:3:0.5:0.85
 
-        stop:S
-            Run the down thrusters at 0.45 and set forward/yaw thrust
-            to zero for S seconds.
-
-        turn:S:Ty
-            Run the down thrusters at 0.45, set forward thrust to zero,
-            and yaw left at thrust Ty for S seconds.
-
-            The turn duration must be tuned in the pool until it produces
-            approximately 180 degrees of rotation.
-
-        All commands run in STABILIZE with no gaps between steps.
+        applies 0.45 vertical stabilization thrust, 0.50 forward thrust and
+        0.85 roll command for 3 seconds. Positive ROLL_THRUST rolls one way,
+        negative the other. Barrel roll runs in ACRO (continuous roll rate);
+        every other step runs in STABILIZE, back-to-back with no gaps.
         """
-
         self.enter("HARD_CODE_SEQUENCE")
 
-        # Every step is normalized to:
-        # (
-        #     command_name,
-        #     seconds,
-        #     down_thrust,
-        #     forward_thrust,
-        #     turn_yaw_thrust,
-        # )
-        #
-        # turn_yaw_thrust is signed:
-        # negative = left
-        # positive = right
+        # Each step is stored as:
+        # (command, seconds, down_thrust, forward_thrust, yaw_thrust, roll_thrust)
         steps = []
 
-        for tok in self.hc_sequence.split():
-            p = tok.split(":")
-            command = p[0].lower()
+        for token in self.hc_sequence.split():
+            parts = token.split(":")
+            command = parts[0].lower()
 
             try:
                 if command in ("down", "dn", "d"):
-                    seconds = float(p[1])
-                    down_thrust = clamp(
-                        float(p[2]),
-                        0.0,
-                        1.0,
-                    )
-
-                    steps.append(
-                        (
-                            command,
-                            seconds,
-                            down_thrust,
-                            0.0,
-                            0.0,
-                        )
-                    )
+                    seconds = float(parts[1])
+                    down_thrust = clamp(float(parts[2]), 0.0, 1.0)
+                    step = ("down", seconds, down_thrust, 0.0, 0.0, 0.0)
 
                 elif command in ("fwd", "forward", "fw", "f"):
-                    seconds = float(p[1])
-                    forward_thrust = clamp(
-                        float(p[2]),
-                        0.0,
-                        1.0,
-                    )
-
-                    steps.append(
-                        (
-                            command,
-                            seconds,
-                            0.0,
-                            forward_thrust,
-                            0.0,
-                        )
-                    )
+                    seconds = float(parts[1])
+                    forward_thrust = clamp(float(parts[2]), 0.0, 1.0)
+                    step = ("fwd", seconds, 0.0, forward_thrust, 0.0, 0.0)
 
                 elif command in ("both", "dive", "drive", "df"):
-                    seconds = float(p[1])
-
-                    down_thrust = clamp(
-                        float(p[2]),
-                        0.0,
-                        1.0,
-                    )
-
-                    forward_thrust = clamp(
-                        float(p[3]),
-                        0.0,
-                        1.0,
-                    )
-
-                    steps.append(
-                        (
-                            command,
-                            seconds,
-                            down_thrust,
-                            forward_thrust,
-                            0.0,
-                        )
-                    )
+                    seconds = float(parts[1])
+                    down_thrust = clamp(float(parts[2]), 0.0, 1.0)
+                    forward_thrust = clamp(float(parts[3]), 0.0, 1.0)
+                    step = ("both", seconds, down_thrust, forward_thrust, 0.0, 0.0)
 
                 elif command in ("stop", "hold"):
-                    seconds = float(p[1])
+                    seconds = float(parts[1])
+                    # Hold approximately constant depth.
+                    step = ("stop", seconds, 0.45, 0.0, 0.0, 0.0)
 
-                    # Hover command:
-                    # down thrust = 0.45
-                    # forward thrust = 0
-                    # yaw thrust = 0
-                    steps.append(
-                        (
-                            command,
-                            seconds,
-                            0.45,
-                            0.0,
-                            0.0,
-                        )
-                    )
+                elif command in ("turn", "turnleft", "left", "uturn"):
+                    seconds = float(parts[1])
+                    yaw_thrust = clamp(float(parts[2]), 0.0, 1.0)
+                    # 0.45 stabilization thrust while yawing left.
+                    step = ("turn", seconds, 0.45, 0.0, -yaw_thrust, 0.0)
 
-                elif command in (
-                    "turn",
-                    "turnleft",
-                    "left",
-                    "uturn",
-                ):
-                    seconds = float(p[1])
-
-                    yaw_thrust = clamp(
-                        float(p[2]),
-                        0.0,
-                        1.0,
-                    )
-
-                    # Hold depth using the same thrust as stop,
-                    # apply no forward thrust, and yaw left.
-                    #
-                    # Negative r is being used as the left-yaw command.
-                    steps.append(
-                        (
-                            command,
-                            seconds,
-                            0.45,
-                            0.0,
-                            -yaw_thrust,
-                        )
-                    )
+                elif command in ("barrel_roll", "barrelroll", "barrel", "roll"):
+                    seconds = float(parts[1])
+                    forward_thrust = clamp(float(parts[2]), 0.0, 1.0)
+                    roll_thrust = clamp(float(parts[3]), -1.0, 1.0)
+                    # 0.45 stabilization while moving forward and rolling.
+                    step = ("barrel_roll", seconds, 0.45, forward_thrust, 0.0, roll_thrust)
 
                 else:
-                    self._log(
-                        "warn",
-                        (
-                            f"skip step '{tok}' "
-                            "(command must be "
-                            "down/fwd/both/stop/turn)"
-                        ),
-                    )
+                    self._log("warn", f"skip step '{token}': unknown command")
+                    continue
+
+                if seconds <= 0.0:
+                    self._log("warn",
+                        f"skip step '{token}': seconds must be greater than zero")
+                    continue
+
+                steps.append(step)
 
             except (IndexError, ValueError):
-                self._log(
-                    "warn",
-                    (
-                        f"skip bad step '{tok}'. Expected: "
-                        "down:seconds:thrust, "
-                        "fwd:seconds:thrust, "
-                        "both:seconds:down:fwd, "
-                        "stop:seconds, or "
-                        "turn:seconds:yaw_thrust"
-                    ),
-                )
+                self._log("warn",
+                    f"skip bad step '{token}'. Expected: down:seconds:thrust, "
+                    "fwd:seconds:thrust, both:seconds:down:fwd, stop:seconds, "
+                    "turn:seconds:yaw, or barrel_roll:seconds:forward:roll")
 
         if not steps:
-            raise Abort(
-                "hard_code_sequence has no valid steps"
-            )
+            raise Abort("hard_code_sequence has no valid steps")
 
-        self._log(
-            "warn",
-            (
-                f"OPEN-LOOP SEQUENCE: {len(steps)} steps, "
-                "STABILIZE, NO baro, NO gaps -- "
-                + " ".join(
-                    (
-                        f"{command}:{seconds:.0f}s"
-                        f"(dn{down_thrust:.2f}/"
-                        f"fw{forward_thrust:.2f}/"
-                        f"yaw{turn_yaw_thrust:.2f})"
-                    )
-                    for (
-                        command,
-                        seconds,
-                        down_thrust,
-                        forward_thrust,
-                        turn_yaw_thrust,
-                    ) in steps
-                )
-            ),
-        )
+        self._log("warn", f"OPEN-LOOP SEQUENCE: {len(steps)} steps")
 
-        for i, (
-            command,
-            seconds,
-            down_thrust,
-            forward_thrust,
-            turn_yaw_thrust,
-        ) in enumerate(steps, 1):
+        for index, (command, seconds, down_thrust, forward_thrust,
+                    yaw_thrust, roll_thrust) in enumerate(steps, start=1):
 
-            # Convert down-thrust fraction into the MAVROS z command.
-            z = clamp(
-                Z_NEUTRAL
-                - self.altitude_sign
-                * down_thrust
-                * 500.0,
-                0.0,
-                1000.0,
-            )
+            # Forward/back command.
+            x_command = forward_thrust * 1000.0
+            # Roll command (differential thrust between the vertical thrusters).
+            y_command = roll_thrust * 1000.0
+            # Vertical/heave command.
+            z_command = clamp(
+                Z_NEUTRAL - self.altitude_sign * down_thrust * 500.0,
+                0.0, 1000.0)
 
-            # Convert forward-thrust fraction into the MAVROS x command.
-            x = forward_thrust * 1000.0
-
-            # turn/stop command yaw OPEN-LOOP (a fixed r for the whole step);
-            # everything else holds gate_heading, which means yaw_to() has to
-            # be re-evaluated every tick inside the loop below -- a single
-            # correction computed once here would freeze the PI loop for the
-            # entire step and hold a stale demand instead of tracking.
-            if command in (
-                "turn",
-                "turnleft",
-                "left",
-                "uturn",
-            ):
-                # Direct open-loop left-yaw command.
-                fixed_yaw = turn_yaw_thrust * 1000.0
-
-            elif command in ("stop", "hold"):
-                # Do not allow heading correction to actuate the
-                # forward thrusters during stop.
+            if command == "turn":
+                # Direct timed yaw command.
+                fixed_yaw = yaw_thrust * 1000.0
+            elif command in ("stop", "barrel_roll"):
+                # No automatic heading correction during stop or barrel roll.
                 fixed_yaw = 0.0
-
             else:
                 fixed_yaw = None   # -> heading hold, recomputed per tick
 
-            # A turn slews the vehicle deliberately; the heading error it
-            # builds up is not disturbance to be integrated away on the next
-            # heading-hold step.
+            # A turn slews the vehicle deliberately; the heading error it builds
+            # is not disturbance for the next heading-hold step to integrate away.
             self.reset_pi()
 
-            label = (
-                f"x={x:.0f} "
-                f"z={z:.0f} "
-                f"r={'hold' if fixed_yaw is None else f'{fixed_yaw:.0f}'}"
-            )
+            label = (f"x={x_command:.0f} y={y_command:.0f} z={z_command:.0f} "
+                     f"r={'hold' if fixed_yaw is None else f'{fixed_yaw:.0f}'}")
 
-            self._log(
-                "info",
-                (
-                    f" step {i}/{len(steps)}: "
-                    f"{command} {seconds:.1f}s "
-                    f"down {down_thrust:.2f} / "
-                    f"fwd {forward_thrust:.2f} / "
-                    f"yaw {turn_yaw_thrust:.2f} "
-                    f"({label})"
-                ),
-            )
+            self._log("info",
+                f"step {index}/{len(steps)}: {command} for {seconds:.1f}s ({label})")
+
+            if command == "barrel_roll":
+                # Remove any roll input before switching modes.
+                self.publish(x_command, 0.0, z=z_command, y=0.0)
+                # STABILIZE limits roll angle; ACRO allows a continuous roll rate.
+                if not self.set_mode("ACRO"):
+                    raise Abort("could not switch to ACRO for barrel roll")
+                self._log("warn",
+                    "BARREL ROLL: ACRO mode active. Timed open-loop maneuver.")
 
             end_time = time.time() + seconds
-
             while time.time() < end_time:
-                self.log_every(
-                    "hc_seq",
-                    1.0,
-                    (
-                        lambda i=i,
-                        label=label,
-                        end_time=end_time: (
-                            f" step {i}/{len(steps)} "
-                            f"{label} "
-                            f"{end_time - time.time():.1f}s left"
-                        )
-                    ),
-                )
+                yaw_command = (self.yaw_to(self.gate_heading)
+                               if fixed_yaw is None else fixed_yaw)
+                self.log_every("hc_seq", 1.0,
+                    lambda index=index, label=label, end_time=end_time: (
+                        f"step {index}/{len(steps)} {label} "
+                        f"{end_time - time.time():.1f}s left"))
+                self.tick(x_command, yaw_command, z=z_command, y=y_command)
 
-                yaw_command = (
-                    self.yaw_to(self.gate_heading)
-                    if fixed_yaw is None
-                    else fixed_yaw
-                )
+            if command == "barrel_roll":
+                # Stop the roll rate before returning to stabilized flight.
+                self.publish(x_command, 0.0, z=z_command, y=0.0)
+                if not self.set_mode("STABILIZE"):
+                    raise Abort("could not return to STABILIZE after barrel roll")
+                self._log("info", "BARREL ROLL complete; STABILIZE restored.")
 
-                self.tick(
-                    x,
-                    yaw_command,
-                    z=z,
-                )
+            # No neutral delay between sequence commands.
 
-            # No delay or neutral command between steps.
-
-        self._log(
-            "info",
-            "OPEN-LOOP SEQUENCE done.",
-        )
+        self._log("info", "OPEN-LOOP SEQUENCE done.")
 
     def hard_code_descend_timed(self):
         """OPEN-LOOP descent (hard_code_open_loop): command down-thrust for a
